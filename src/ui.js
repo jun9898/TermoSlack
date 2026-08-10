@@ -987,14 +987,12 @@ export function createUI() {
     screen.render();
   });
 
-  screen.key(['C-j'], (ch, key) => {
-    if (key) key.name = 'unreadjump';
+  screen.key(['C-n'], () => {
     if (isTyping() || !channelList.focused) return;
     jumpToUnread(1);
   });
 
-  screen.key(['C-k'], (ch, key) => {
-    if (key) key.name = 'unreadjump';
+  screen.key(['C-p'], () => {
     if (isTyping() || !channelList.focused) return;
     jumpToUnread(-1);
   });
