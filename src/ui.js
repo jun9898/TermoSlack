@@ -943,6 +943,7 @@ export function createUI() {
 
   // O key - Open image in browser
   screen.key(['o'], async () => {
+    if (isTyping()) return;
     if (!imageViewer.hidden && imageViewer.currentImageUrl) {
       try {
         const open = (await import('open')).default;
@@ -1003,12 +1004,13 @@ export function createUI() {
 
   // T key - View thread
   screen.key(['t'], async () => {
+    if (isTyping()) return;
     await openSelectedThread();
   });
 
   // I key - Enter input mode
   screen.key(['i'], () => {
-    if (searchMode || globalSearchMode || userSearchMode || joinMode) return;
+    if (isTyping()) return;
     if (input.hidden) return;
     input.focus();
     screen.render();
@@ -1016,6 +1018,7 @@ export function createUI() {
 
   // L key - Enter (channel list -> chat, chat -> thread)
   screen.key(['l'], async () => {
+    if (isTyping()) return;
     if (channelList.focused) {
       focusChatArea();
       return;
@@ -1027,6 +1030,7 @@ export function createUI() {
 
   // H key - Leave (thread -> chat, chat -> channel list)
   screen.key(['h'], () => {
+    if (isTyping()) return;
     if (threadMode) {
       closeThread();
       screen.render();
@@ -1053,6 +1057,7 @@ export function createUI() {
   });
 
   screen.key(['v'], async () => {
+    if (isTyping()) return;
     if (messages.length > 0) {
       // Find messages with images and show the most recent one
       const messagesWithImages = messages.filter(msg => msg.has_images);
@@ -1677,6 +1682,11 @@ async function selectChannel(index) {
     
     screen.render();
   }
+}
+
+function isTyping() {
+  if (searchMode || globalSearchMode || userSearchMode || joinMode) return true;
+  return !!(input && input.focused);
 }
 
 function updateBorders() {
