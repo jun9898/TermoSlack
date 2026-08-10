@@ -20,6 +20,7 @@
                 "channels:read",
                 "channels:write",
                 "chat:write",
+                "emoji:read",
                 "files:read",
                 "files:write",
                 "groups:history",

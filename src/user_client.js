@@ -461,11 +461,34 @@ export async function getCustomEmojis() {
     if (!userClient) return {};
     try {
         const result = await userClient.emoji.list();
-        return result.emoji || {};
+        if (result.emoji && Object.keys(result.emoji).length > 0) return result.emoji;
     } catch (error) {
-        logError('Failed to fetch custom emojis', error);
-        return {};
+        logError('Failed to fetch custom emojis via OAuth, trying session credentials', error);
     }
+    return getCustomEmojisViaSession();
+}
+
+async function getCustomEmojisViaSession() {
+    const { config } = await import('./config.js');
+    if (!config.xoxc || !config.xoxd) return {};
+    try {
+        const fetch = (await import('node-fetch')).default;
+        const result = await fetch('https://slack.com/api/emoji.list', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${config.xoxc}`,
+                Cookie: `d=${config.xoxd}`
+            }
+        }).then(r => r.json());
+        if (result.ok && result.emoji) {
+            logInfo(`Loaded ${Object.keys(result.emoji).length} custom emojis via session credentials`);
+            return result.emoji;
+        }
+        logError(`emoji.list via session failed: ${result.error || 'unknown'}`);
+    } catch (error) {
+        logError('Failed to fetch custom emojis via session credentials', error);
+    }
+    return {};
 }
 
 export async function searchMessages(query, options = {}) {

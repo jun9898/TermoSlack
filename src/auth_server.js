@@ -21,6 +21,7 @@ const userScopes = [
         "im:read",
         "im:write",
         "im:history",
+        "emoji:read",
         "files:read",
         "files:write",
         "reactions:read",

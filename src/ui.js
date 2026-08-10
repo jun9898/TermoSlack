@@ -1094,6 +1094,53 @@ export function createUI() {
     screen.render();
   });
 
+  screen.key(['S-e'], async () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+
+    const names = [];
+    const text = msg.raw_text || msg.text || '';
+    for (const match of text.matchAll(CUSTOM_EMOJI_PATTERN)) names.push(match[1]);
+    for (const reaction of msg.reactions || []) names.push(reaction.name);
+
+    let found = null;
+    for (const name of names) {
+      const resolved = resolveCustomEmoji(name);
+      if (resolved?.url) { found = { name, url: resolved.url }; break; }
+    }
+
+    if (!found) {
+      statusBar.setContent(' Status: No custom emoji in this message');
+      screen.render();
+      return;
+    }
+
+    statusBar.setContent(` Status: Loading :${found.name}:...`);
+    screen.render();
+
+    try {
+      const art = await getCachedImage(found.url, getUserToken(), {
+        width: Math.min(screen.width, 60),
+        height: Math.min(screen.height, 28)
+      });
+      if (imageViewer.infoBox) {
+        imageViewer.infoBox.setContent(` {bold}:${found.name}:{/bold} | Press Esc to close | O to open in browser`);
+      }
+      imageViewer.setContent(art);
+      imageViewer.currentImageUrl = found.url;
+      imageViewer.show();
+      imageViewer.focus();
+      statusBar.setContent(` Status: :${found.name}:`);
+    } catch (error) {
+      statusBar.setContent(` Status: Failed to load emoji - ${error.message}`);
+      logError('Failed to preview custom emoji', error);
+      imageViewer.hide();
+      screen.realloc();
+    }
+    screen.render();
+  });
+
   screen.key(['n'], () => {
     if (isTyping() || !channelList.focused) return;
     jumpToUnread(1);
@@ -2790,28 +2837,45 @@ async function loadCustomEmojis() {
   try {
     customEmojis = await getCustomEmojis();
     logInfo(`Loaded ${Object.keys(customEmojis).length} custom emojis`);
+    if (Object.keys(customEmojis).length > 0 && messages.length > 0) {
+      for (const msg of messages) msg._fmt = null;
+      if (!chatBox.hidden) displayMessages(messages);
+    }
   } catch (e) {
     logError('Failed to load custom emojis', e);
   }
 }
 
+const CUSTOM_EMOJI_PATTERN = /:([\w가-힣ㄱ-ㅎㅏ-ㅣ+'-]+):/g;
+
+function resolveCustomEmoji(name) {
+  let value = customEmojis[name];
+  for (let hop = 0; hop < 3 && typeof value === 'string' && value.startsWith('alias:'); hop++) {
+    const target = value.slice(6);
+    const std = emojify(`:${target}:`);
+    if (std !== `:${target}:`) return { glyph: std };
+    value = customEmojis[target];
+  }
+  if (typeof value === 'string' && value.startsWith('http')) return { url: value };
+  return null;
+}
+
 function processText(text) {
   if (!text) return '';
-  
+
   // 1. Standard Emojis
   try { text = emojify(text); } catch (e) {}
-  
+
   // 2. Custom Emojis
   // Look for :shortcode: patterns
   const theme = getTheme();
-  text = text.replace(/:([\w-]+):/g, (match, name) => {
-    if (customEmojis[name]) {
-      // It's a valid custom emoji
-      return `${theme.tags.attachment}${match}${theme.tags.reset}`;
-    }
-    return match;
+  text = text.replace(CUSTOM_EMOJI_PATTERN, (match, name) => {
+    const resolved = resolveCustomEmoji(name);
+    if (!resolved) return match;
+    if (resolved.glyph) return resolved.glyph;
+    return `${theme.tags.attachment}${match}${theme.tags.reset}`;
   });
-  
+
   return text;
 }
 
@@ -2828,7 +2892,10 @@ function formatReactions(msg, fmt, theme) {
   const parts = msg.reactions.map(r => {
     let glyph;
     try { glyph = emojify(`:${r.name}:`); } catch (e) { glyph = `:${r.name}:`; }
-    if (glyph === `:${r.name}:`) glyph = customEmojis[r.name] ? `:${r.name}:` : glyph;
+    if (glyph === `:${r.name}:`) {
+      const resolved = resolveCustomEmoji(r.name);
+      if (resolved?.glyph) glyph = resolved.glyph;
+    }
     return `${glyph} ${r.count}`;
   });
   fmt.rxBody = `${theme.tags.time}${parts.join('   ')}${theme.tags.reset}`;
