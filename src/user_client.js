@@ -3,10 +3,30 @@ import { logInfo, logError } from "./logger.js";
 import { log } from "console";
 
 let userClient = null;
+let authMode = null;
+let sessionCookie = null;
 
-export function initUserClient(token) {
-    userClient = new WebClient(token);
+export function initUserClient(token, cookie = null) {
+    if (cookie) {
+        userClient = new WebClient(token, { headers: { Cookie: `d=${cookie}` } });
+        authMode = 'session';
+        sessionCookie = cookie;
+    } else {
+        userClient = new WebClient(token);
+        authMode = 'oauth';
+        sessionCookie = null;
+    }
     return userClient;
+}
+
+export function resetUserClient() {
+    userClient = null;
+    authMode = null;
+    sessionCookie = null;
+}
+
+export function getAuthMode() {
+    return authMode;
 }
 
 export function getUserClient() {
@@ -15,6 +35,20 @@ export function getUserClient() {
 
 export function getUserToken(){
     return userClient?.token;
+}
+
+export function getFileFetchHeaders(token) {
+    const headers = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    if (sessionCookie && (!token || token.startsWith('xoxc-'))) headers.Cookie = `d=${sessionCookie}`;
+    return headers;
+}
+
+export async function verifyAuth() {
+    if (!userClient) throw new Error('User client not initialized');
+    const result = await userClient.auth.test();
+    if (!result.ok) throw new Error(result.error || 'auth.test failed');
+    return result;
 }
 
 export async function getCurrentUserId() {
@@ -29,6 +63,9 @@ export async function getCurrentUserId() {
 }
 
 export function makeUserClient(userToken) {
+    if (sessionCookie && typeof userToken === 'string' && userToken.startsWith('xoxc-')) {
+        return new WebClient(userToken, { headers: { Cookie: `d=${sessionCookie}` } });
+    }
     return new WebClient(userToken);
 }
 
@@ -736,6 +773,11 @@ export async function loadDMUserNames(channels, onProgress) {
 }
 export async function logoutUser() {
   if(!userClient) return;
+  if (authMode === 'session') {
+    logInfo("Session mode: skipping auth.revoke so the browser session stays valid. Remove SLACK_XOXC / SLACK_XOXD from .env to log out.");
+    resetUserClient();
+    return;
+  }
   try{
     logInfo("Logging out user");
     await userClient.auth.revoke();
@@ -904,6 +946,9 @@ export async function uploadFile(channelId, filePath, title, threadTs = null) {
         return result;
     } catch (error) {
         logError(`Failed to upload file to ${channelId}`, error);
+        if (authMode === 'session') {
+            throw new Error(`Upload failed in session mode: ${error.message}. Session tokens may be rejected for file uploads — authenticate with OAuth if this keeps happening.`);
+        }
         throw error;
     }
 }

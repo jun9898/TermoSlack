@@ -5,6 +5,7 @@ import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { logInfo, logError } from "./logger.js";
+import { getFileFetchHeaders } from "./user_client.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,10 +39,13 @@ export async function getCachedImage(url, token, options = {}) {
     }
     logInfo("Downloading image: " + url);
     const response = await fetch(url,{
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: getFileFetchHeaders(token)
     });
     if (!response.ok) {
         throw new Error(`Failed to fetch image: ${response.statusText}`);
+    }
+    if (!/^image\//.test(response.headers.get('content-type') || '')) {
+        throw new Error('Slack returned a login page instead of the image (file download not authorized)');
     }
     const buffer = await response.buffer();
 
@@ -67,9 +71,12 @@ export async function getImageBuffer(url, token) {
         if (fs.existsSync(cachePath)) return fs.readFileSync(cachePath);
 
         const response = await fetch(url, {
-            headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+            headers: getFileFetchHeaders(token)
         });
         if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
+        if (!/^image\//.test(response.headers.get('content-type') || '')) {
+            throw new Error('Slack returned a login page instead of the image (file download not authorized)');
+        }
         const buffer = await response.buffer();
 
         writeCacheAtomic(cachePath, buffer);

@@ -7,7 +7,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { saveSession, loadSession, listSessions } from './storage.js';
-import { initUserClient } from './user_client.js';
+import { initUserClient, resetUserClient, verifyAuth } from './user_client.js';
+import { config } from './config.js';
 import { logInfo, logError, logWarn } from './logger.js';
 
 // Global error handlers to prevent crashes
@@ -108,6 +109,40 @@ async function main() {
     });
   }
 
+  async function trySessionCredentials() {
+    const sessionToken = config.xoxc || process.env.SLACK_XOXC;
+    const sessionCookie = config.xoxd || process.env.SLACK_XOXD;
+    if (!sessionToken || !sessionCookie) return false;
+
+    logInfo('No OAuth session found, trying browser session credentials');
+    initUserClient(sessionToken, sessionCookie);
+
+    let auth;
+    try {
+      auth = await verifyAuth();
+    } catch (e) {
+      resetUserClient();
+      logError('Session credentials rejected by auth.test', e);
+      console.log('✗ SLACK_XOXC / SLACK_XOXD were rejected by Slack (auth.test failed).');
+      console.log('  The browser token has probably expired. Copy fresh values from your Slack web session into .env.');
+      console.log('  Falling back to OAuth login.\n');
+      return false;
+    }
+
+    currentUserSession = {
+      userToken: sessionToken,
+      teamId: auth.team_id,
+      userId: auth.user_id,
+      teamName: auth.team,
+      authMode: 'session'
+    };
+
+    console.log(`✓ Session credentials accepted (${auth.user} @ ${auth.team})! Loading TermoSlack...\n`);
+    await initializeApp();
+    logInfo(`Session mode active for ${auth.user_id} in workspace ${auth.team}`);
+    return true;
+  }
+
   console.log('\n=== TermoSlack ===');
 
   // Check for existing session
@@ -119,26 +154,42 @@ async function main() {
     const session = loadSession(teamId, userId);
     
     if (session && session.userToken) {
+      let restored = false;
       try {
         logInfo('Attempting to restore session');
         initUserClient(session.userToken);
+        await verifyAuth();
+        restored = true;
+      } catch (e) {
+        resetUserClient();
+        logWarn('Saved session is invalid or expired');
+        logError('Session restore error', e);
+        console.log('✗ Saved OAuth session is invalid or expired.');
+      }
+
+      if (restored) {
         currentUserSession = session;
         currentUserSession.userId = userId;
         currentUserSession.teamId = teamId;
+        currentUserSession.authMode = 'oauth';
 
         console.log('✓ Session found! Loading TermoSlack...\n');
         await initializeApp();
         logInfo('Session restored and channels loaded');
         return; // Exit - don't start auth server
-      } catch (e) {
-        logWarn('Saved session is invalid or expired');
-        logError('Session restore error', e);
-        console.log('✗ Saved session is invalid or expired.');
       }
     }
   }
   
+  if (await trySessionCredentials()) return;
+
   // If we get here, we need authentication
+  if (!config.hasOAuthApp) {
+    console.log('✗ No usable credentials. Set SLACK_XOXC + SLACK_XOXD in .env for session-only mode,');
+    console.log('  or SLACK_CLIENT_ID + SLACK_CLIENT_SECRET to log in through OAuth.\n');
+    return;
+  }
+
   console.log(`To authenticate, open: ${getAuthUrl()}\n`);
   console.log('Waiting for authentication...\n');
   startAuthServer();

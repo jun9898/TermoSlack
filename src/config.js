@@ -26,7 +26,9 @@ export const config = {
   userScopes: process.env.OAUTH_USER_SCOPES || "channels:read,channels:write,channels:history,chat:write,users:read,groups:read,groups:write,groups:history,mpim:read,mpim:write,mpim:history,im:read,im:write,im:history,files:read,files:write,reactions:read,reactions:write,search:read,emoji:read"
 };
 
-// simple validation
-if (!config.clientId || !config.clientSecret) {
-  console.warn("⚠️  OAuth credentials are missing in .env. Make sure SLACK_CLIENT_ID and SLACK_CLIENT_SECRET are set.");
+config.hasSessionCredentials = Boolean(config.xoxc && config.xoxd);
+config.hasOAuthApp = Boolean(config.clientId && config.clientSecret);
+
+if (!config.hasSessionCredentials && !config.hasOAuthApp) {
+  console.warn("⚠️  No Slack credentials in .env. Set SLACK_XOXC + SLACK_XOXD for session-only mode, or SLACK_CLIENT_ID + SLACK_CLIENT_SECRET for OAuth.");
 }
