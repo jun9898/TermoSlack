@@ -780,8 +780,8 @@ export function createUI() {
     }
   });
 
-  // Ctrl+F or F - Activate search
-  screen.key(['C-f', 'f'], () => {
+  // Ctrl+F or / - Activate search
+  screen.key(['C-f', '/'], () => {
     if (isTyping()) return;
     if (!searchMode) {
       searchMode = true;
