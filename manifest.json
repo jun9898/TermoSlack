@@ -34,6 +34,7 @@
                 "reactions:read",
                 "reactions:write",
                 "search:read",
+                "stars:read",
                 "users:read"
             ],
             "bot": [

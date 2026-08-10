@@ -1,5 +1,6 @@
 import blessed from 'neo-blessed';
-import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName, seedUserNames, editMessage, deleteMessage, addReaction, getPermalink } from './user_client.js';
+import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName, seedUserNames, editMessage, deleteMessage, addReaction, getPermalink, listFiles, loadSavedMessages } from './user_client.js';
+import { fetchSavedItems, hasSavedCredentials } from './saved.js';
 import { exec } from 'child_process';
 import open from 'open';
 import { logInfo, logError } from './logger.js';
@@ -58,7 +59,12 @@ let pollingInFlight = false;
 let channelLoadSeq = 0;
 let selfDisplayName = null;
 let currentChannelId = null;
-let currentView = 'channels'; // 'channels' or 'dms'
+let currentView = 'channels'; // 'channels' | 'dms' | 'activity' | 'files' | 'saved'
+let railBox = null;
+let filesBox = null;
+let savedBox = null;
+let fileEntries = [];
+let savedEntries = [];
 let searchMode = false;
 let searchQuery = '';
 let joinMode = false;
@@ -104,6 +110,17 @@ const NEWLINE_SEQUENCES = ['\x1b\r', '\x1b\n', '\x1b[13;2u', '\x1b[13;3u', '\x1b
 
 const MAX_LOADED_MESSAGES = 300;
 
+const RAIL_WIDTH = 12;
+const RAIL_MIN_LIST_WIDTH = 12;
+const RAIL_MIN_SCREEN_WIDTH = (RAIL_WIDTH + RAIL_MIN_LIST_WIDTH) * 4;
+const RAIL_ENTRIES = [
+  { view: 'channels', label: '1 홈' },
+  { view: 'dms', label: '2 DM' },
+  { view: 'activity', label: '3 활동' },
+  { view: 'files', label: '4 파일' },
+  { view: 'saved', label: '5 나중에' }
+];
+
 export function createUI() {
   screen = blessed.screen({
     smartCSR: false,
@@ -127,11 +144,34 @@ export function createUI() {
     style: getTheme().header
   });
 
+  railBox = blessed.list({
+    top: 3,
+    left: 0,
+    width: RAIL_WIDTH,
+    height: '100%-6',
+    label: ' Views ',
+    tags: true,
+    keys: false,
+    vi: false,
+    mouse: false,
+    interactive: true,
+    items: RAIL_ENTRIES.map(entry => ` ${entry.label}`),
+    style: {
+      ...getTheme().primary,
+      item: getTheme().item,
+      selected: getTheme().selected,
+      border: getTheme().border
+    },
+    border: {
+      type: 'line'
+    }
+  });
+
   // Channel/DM List (left side)
   channelList = blessed.list({
     top: 3,
-    left: 0,
-    width: '25%',
+    left: RAIL_WIDTH,
+    width: `25%-${RAIL_WIDTH}`,
     height: '100%-6',
     label: ' Channels ',
     keys: true,
@@ -203,6 +243,58 @@ export function createUI() {
       style: { inverse: true }
     },
     border: {type: 'line'},
+    style: {
+      border: getTheme().border,
+      selected: getTheme().selected,
+      item: getTheme().item,
+      ...getTheme().primary
+    },
+    hidden: true
+  });
+
+  filesBox = blessed.list({
+    top: 3,
+    left: '25%',
+    width: '75%',
+    height: '100%-9',
+    label: ' Files ',
+    tags: true,
+    keys: true,
+    vi: true,
+    mouse: true,
+    scrollable: true,
+    scrollbar: {
+      ch: ' ',
+      track: { bg: 'grey' },
+      style: { inverse: true }
+    },
+    border: { type: 'line' },
+    style: {
+      border: getTheme().border,
+      selected: getTheme().selected,
+      item: getTheme().item,
+      ...getTheme().primary
+    },
+    hidden: true
+  });
+
+  savedBox = blessed.list({
+    top: 3,
+    left: '25%',
+    width: '75%',
+    height: '100%-9',
+    label: ' Later ',
+    tags: true,
+    keys: true,
+    vi: true,
+    mouse: true,
+    scrollable: true,
+    scrollbar: {
+      ch: ' ',
+      track: { bg: 'grey' },
+      style: { inverse: true }
+    },
+    border: { type: 'line' },
     style: {
       border: getTheme().border,
       selected: getTheme().selected,
@@ -534,6 +626,7 @@ export function createUI() {
   imageViewer.infoBox = imageInfoBox;
 
   screen.append(header);
+  screen.append(railBox);
   screen.append(channelList);
   screen.append(chatBox);
   screen.append(input);
@@ -634,6 +727,15 @@ export function createUI() {
   screen.append(searchResultsBox);
   screen.append(threadBox);
   screen.append(activityBox);
+  screen.append(filesBox);
+  screen.append(savedBox);
+
+  applyRailLayout();
+  updateRail();
+  screen.on('resize', () => {
+    applyRailLayout();
+    screen.render();
+  });
 
   // Start with channel list focused
   channelList.focus();
@@ -765,60 +867,64 @@ export function createUI() {
   // F3 - Toggle Activity View
   screen.key(['f3', '3'], async () => {
     if (isTyping()) return;
-    if (currentView === 'activity') {
-      currentView = 'channels'; // Default back to channels
-      updateView();
-      updateButtonStyles();
-      screen.render();
-    } else {
-      currentView = 'activity';
-      updateView();
-      updateButtonStyles();
-      screen.render();
-      await loadActivity();
-    }
+    if (toggleOverlayView('activity')) await loadActivity();
+  });
+
+  screen.key(['f4', '4'], async () => {
+    if (isTyping()) return;
+    if (toggleOverlayView('files')) await loadFiles();
+  });
+
+  screen.key(['f5', '5'], async () => {
+    if (isTyping()) return;
+    if (toggleOverlayView('saved')) await loadSaved();
   });
 
   // Handle Activity Selection
   activityBox.on('select', async (item, index) => {
     const match = activityMatches[index];
-    if (match && match.channel) {
-      // Switch to the channel
-      const channelId = match.channel.id;
-      currentChannelId = channelId;
-      currentView = 'channels'; // Switch to main view
-      
-      statusBar.setContent(` Status: Jumping to #${match.channel.name}...`);
-      updateView();
+    if (!match || !match.channel) return;
+    await jumpToMessage({
+      channelId: match.channel.id,
+      ts: match.ts,
+      threadTs: match.thread_ts || null,
+      label: match.channel.name || match.channel.id
+    });
+  });
+
+  savedBox.on('select', async (item, index) => {
+    const entry = savedEntries[index];
+    if (!entry) return;
+    if (entry.missing) {
+      statusBar.setContent(' Status: That saved message is no longer available');
       screen.render();
-      
-      try {
-        // Load messages for this channel (background context)
-        const msgs = await loadMessages(currentChannelId, 50);
-        messages = msgs;
-        selectedMessageIndex = messages.length - 1;
-        displayMessages(messages);
-        chatBox.setScrollPerc(100);
-        
-        // If it's a thread reply, open the thread
-        if (match.thread_ts) {
-          statusBar.setContent(` Status: Opening thread in #${match.channel.name}...`);
-          screen.render();
-          await viewThread(match.thread_ts);
-        } else {
-          // It's a regular message - try to highlight it
-          const msgIndex = messages.findIndex(m => m.ts === match.ts);
-          if (msgIndex !== -1) {
-            selectedMessageIndex = msgIndex;
-            displayMessages(messages);
-          }
-          chatBox.focus();
-          statusBar.setContent(` Status: Viewed activity in #${match.channel.name}`);
-        }
-      } catch (error) {
-        statusBar.setContent(` Status: Error loading activity - ${error.message}`);
-      }
+      return;
     }
+    await jumpToMessage({
+      channelId: entry.channelId,
+      ts: entry.ts,
+      threadTs: entry.threadTs,
+      label: entry.channelName
+    });
+  });
+
+  filesBox.on('select', async (item, index) => {
+    const file = fileEntries[index];
+    if (!file) return;
+    const url = file.permalink || file.url_private;
+    if (!url) {
+      statusBar.setContent(' Status: No link available for this file');
+      screen.render();
+      return;
+    }
+    try {
+      await open(url);
+      statusBar.setContent(` Status: Opened ${file.name} in browser`);
+    } catch (error) {
+      statusBar.setContent(` Status: Could not open file - ${error.message}`);
+      logError('Failed to open file link', error);
+    }
+    screen.render();
   });
 
   // Tab - Cycle focus: channels -> messages -> input -> channels
@@ -1239,7 +1345,7 @@ export function createUI() {
   screen.key(['escape'], () => {
     if (!imageViewer.hidden) {
       imageViewer.hide();
-      chatBox.focus();
+      focusWidget(currentView === 'files' ? filesBox : chatBox);
     } else if (threadMode) {
       closeThread();
     } else if (globalSearchMode) {
@@ -1270,8 +1376,7 @@ export function createUI() {
       suggestionsBox.hide();
       channelList.focus();
     } else {
-      // If in DMs view, switch back to Channels view
-      if (currentView === 'dms') {
+      if (currentView !== 'channels') {
         currentView = 'channels';
         updateView();
         updateButtonStyles();
@@ -1345,6 +1450,19 @@ export function createUI() {
 
   screen.key(['v'], async () => {
     if (isTyping()) return;
+
+    if (currentView === 'files') {
+      const file = fileEntries[filesBox.selected];
+      if (!file) return;
+      if (!file.mimetype.startsWith('image/')) {
+        statusBar.setContent(' Status: Preview only works for images (Enter opens in browser)');
+        screen.render();
+        return;
+      }
+      await showImage({ image_files: [file] });
+      return;
+    }
+
     if (messages.length > 0) {
       // Find messages with images and show the most recent one
       const messagesWithImages = messages.filter(msg => msg.has_images);
@@ -2175,11 +2293,86 @@ function startMessagePolling() {
   messagePollTimer = setInterval(refreshOpenChannel, 5000);
 }
 
+function applyRailLayout() {
+  if (!screen || !railBox) return;
+
+  const compact = screen.width < RAIL_MIN_SCREEN_WIDTH;
+  const left = compact ? 0 : RAIL_WIDTH;
+  const width = compact ? '25%' : `25%-${RAIL_WIDTH}`;
+
+  if (compact) railBox.hide();
+  else railBox.show();
+
+  for (const panel of [channelList, searchBox, joinBox, suggestionsBox, userSearchBox, userSuggestionsBox]) {
+    if (!panel) continue;
+    panel.left = left;
+    panel.width = width;
+  }
+}
+
+function updateRail() {
+  if (!railBox) return;
+  const index = RAIL_ENTRIES.findIndex(entry => entry.view === currentView);
+  railBox.select(index >= 0 ? index : 0);
+}
+
+function toggleOverlayView(view) {
+  const opening = currentView !== view;
+  currentView = opening ? view : 'channels';
+  updateView();
+  updateButtonStyles();
+  screen.render();
+  return opening;
+}
+
+async function jumpToMessage({ channelId, ts, threadTs, label }) {
+  if (!channelId) return;
+
+  const name = label || channelId;
+  currentChannelId = channelId;
+  currentView = 'channels';
+
+  statusBar.setContent(` Status: Jumping to #${name}...`);
+  updateView();
+  updateButtonStyles();
+  selectChannelRow(channelId);
+  screen.render();
+
+  try {
+    const msgs = await loadMessages(currentChannelId, 50);
+    messages = msgs;
+    selectedMessageIndex = messages.length - 1;
+    displayMessages(messages);
+    chatBox.setScrollPerc(100);
+
+    if (threadTs) {
+      statusBar.setContent(` Status: Opening thread in #${name}...`);
+      screen.render();
+      await viewThread(threadTs);
+      return;
+    }
+
+    const msgIndex = messages.findIndex(m => m.ts === ts);
+    if (msgIndex !== -1) {
+      selectedMessageIndex = msgIndex;
+      displayMessages(messages);
+    }
+    focusWidget(chatBox);
+    statusBar.setContent(msgIndex !== -1
+      ? ` Status: Jumped to message in #${name}`
+      : ` Status: Opened #${name} (message not in recent history)`);
+  } catch (error) {
+    statusBar.setContent(` Status: Error opening #${name} - ${error.message}`);
+    logError('Failed to jump to message', error);
+  }
+  screen.render();
+}
+
 function updateBorders() {
   const theme = getTheme();
   const accent = theme.focusBorder || 'yellow';
   const base = theme.border || {};
-  const panels = [channelList, chatBox, threadBox, activityBox, input];
+  const panels = [channelList, chatBox, threadBox, activityBox, filesBox, savedBox, input];
 
   for (const panel of panels) {
     if (!panel || !panel.style) continue;
@@ -2189,17 +2382,18 @@ function updateBorders() {
   }
 }
 
+const VIEW_HINTS = {
+  channels: '[Enter] Open | [Ctrl+F] Filter | [F7] Join | [N] Next unread',
+  dms: '[Enter] Open | [Ctrl+D] DM user | [T] Thread',
+  activity: '[Enter] Jump to message | [Esc] Back',
+  files: '[Enter] Open in browser | [V] Preview image | [Esc] Back',
+  saved: '[Enter] Jump to message | [Esc] Back'
+};
+
 function updateButtonStyles() {
-  if (currentView === 'channels') {
-    channelsBtn.setContent('{center}> [1] Channels | [Ctrl+F] Search | [F7] Join <{/center}');
-    dmsBtn.setContent('{center}[2] DMs | [3] Activity | [Ctrl+U] Upload | [Ctrl+Q] Logout{/center}');
-  } else if (currentView === 'dms') {
-    channelsBtn.setContent('{center}[1] Channels{/center}');
-    dmsBtn.setContent('{center}> [2] DMs | [Ctrl+U] Upload | [3] Activity | [Ctrl+Q] Logout <{/center}');
-  } else if (currentView === 'activity') {
-    channelsBtn.setContent('{center}[1] Channels{/center}');
-    dmsBtn.setContent('{center}[2] DMs | > [3] Activity < | [Ctrl+Q] Logout{/center}');
-  }
+  channelsBtn.setContent(`{center}${VIEW_HINTS[currentView] || ''}{/center}`);
+  dmsBtn.setContent('{center}[Ctrl+U] Upload | [Ctrl+S] Search | [Ctrl+T] Theme | [Ctrl+Q] Logout{/center}');
+  updateRail();
 }
 
 function mutedTag() {
@@ -2323,23 +2517,42 @@ function selectChannelRow(channelId) {
   if (index >= 0) channelList.select(index);
 }
 
+const OVERLAY_STATUS = {
+  activity: ' Status: Viewing Activity (Enter to jump to message)',
+  files: ' Status: Viewing Files (Enter to open, V to preview an image)',
+  saved: ' Status: Viewing Later (Enter to jump to message)'
+};
+
+function overlayForView(view) {
+  if (view === 'activity') return activityBox;
+  if (view === 'files') return filesBox;
+  if (view === 'saved') return savedBox;
+  return null;
+}
+
 function updateView() {
   let filteredChannels;
 
-  if (currentView === 'activity') {
+  updateRail();
+
+  const overlay = overlayForView(currentView);
+  for (const box of [activityBox, filesBox, savedBox]) {
+    if (box && box !== overlay) box.hide();
+  }
+
+  if (overlay) {
     chatBox.hide();
     threadBox.hide();
     globalSearchBox.hide();
     searchResultsBox.hide();
-    activityBox.show();
-    activityBox.focus();
-    statusBar.setContent(' Status: Viewing Activity (Enter to jump to message)');
+    overlay.show();
+    overlay.focus();
+    statusBar.setContent(OVERLAY_STATUS[currentView]);
     updateBorders();
     return;
-  } else {
-    activityBox.hide();
-    if (!threadMode && !globalSearchMode && chatBox.hidden) chatBox.show();
   }
+
+  if (!threadMode && !globalSearchMode && chatBox.hidden) chatBox.show();
 
   if (currentView === 'channels') {
     channelList.setLabel(' Channels ');
@@ -2922,6 +3135,7 @@ async function showImage(message) {
 
     imageViewer.setContent(imageText);
     imageViewer.show();
+    imageViewer.setFront();
     imageViewer.focus();
 
     // Store current image URL for browser opening
@@ -3116,6 +3330,19 @@ function pageChannelSelection(direction) {
 
 function jumpToUnread(direction) {
   if (displayRows.length === 0) return;
+
+  if (!hasUnreadData) {
+    statusBar.setContent(' Status: Unread data not loaded yet');
+    screen.render();
+    return;
+  }
+
+  if (unreads.size === 0) {
+    statusBar.setContent(' Status: No unread channels (or unread data unavailable)');
+    screen.render();
+    return;
+  }
+
   const current = channelList.selected || 0;
 
   for (let i = current + direction; i >= 0 && i < displayRows.length; i += direction) {
@@ -3474,6 +3701,138 @@ async function loadActivity() {
   }
 }
 
+function formatFileSize(bytes) {
+  const size = Number(bytes) || 0;
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = size;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return unit === 0 ? `${value} B` : `${value.toFixed(1)} ${units[unit]}`;
+}
+
+function formatFileItem(file) {
+  const muted = mutedTag();
+  const type = file.filetype || (file.mimetype || '').split('/').pop() || 'file';
+  const date = file.ts ? new Date(file.ts * 1000).toLocaleString() : 'unknown date';
+  const meta = `${type} · ${formatFileSize(file.size)} · ${escapeText(file.user_name)} · ${date}`;
+  return `📄 {bold}${escapeText(file.name)}{/bold} ${muted.open}${escapeText(meta)}${muted.close}`;
+}
+
+function renderFileEntries() {
+  if (fileEntries.length === 0) {
+    filesBox.setItems(['No files found.']);
+    filesBox.setLabel(' Files ');
+    return;
+  }
+  filesBox.setItems(fileEntries.map(formatFileItem));
+  filesBox.setLabel(` Files (${fileEntries.length}) `);
+}
+
+async function loadFiles() {
+  filesBox.setLabel(' Files: Loading... ');
+  filesBox.setItems(['Loading files...']);
+  screen.render();
+
+  const files = await listFiles({ count: 50 });
+
+  if (!files) {
+    fileEntries = [];
+    filesBox.setItems(['Could not load files. See logs for details.']);
+    filesBox.setLabel(' Files (Error) ');
+    statusBar.setContent(' Status: Failed to load files');
+    screen.render();
+    return;
+  }
+
+  fileEntries = files;
+  renderFileEntries();
+  screen.render();
+}
+
+function formatSavedItem(entry) {
+  const theme = getTheme();
+  const muted = mutedTag();
+  const date = entry.dateCreated ? new Date(entry.dateCreated * 1000).toLocaleString() : '';
+  const channel = `${theme.tags.channel}#${escapeText(entry.channelName)}${theme.tags.reset}`;
+
+  if (entry.missing) {
+    return `🔖 ${channel} ${muted.open}(message unavailable) ${date}${muted.close}`;
+  }
+
+  let text = (entry.text || '').replace(/\n/g, ' ').substring(0, 80);
+  if ((entry.text || '').length > 80) text += '...';
+  text = processText(text);
+
+  const threadLabel = entry.threadTs ? ` ${theme.tags.thread}(Thread)${theme.tags.reset}` : '';
+  return `🔖 ${channel}${threadLabel} {bold}${escapeText(entry.userName || 'Unknown')}{/bold}: ${escapeText(text)} ${muted.open}(${date})${muted.close}`;
+}
+
+function renderSavedEntries() {
+  if (savedEntries.length === 0) {
+    savedBox.setItems(['Nothing saved for later.']);
+    savedBox.setLabel(' Later ');
+    return;
+  }
+  savedBox.setItems(savedEntries.map(formatSavedItem));
+  savedBox.setLabel(` Later (${savedEntries.length}) `);
+}
+
+async function loadSaved() {
+  savedBox.setLabel(' Later: Loading... ');
+  savedBox.setItems(['Loading saved items...']);
+  screen.render();
+
+  if (!hasSavedCredentials()) {
+    savedEntries = [];
+    savedBox.setItems([
+      'Later needs Slack session credentials.',
+      'Set SLACK_XOXC and SLACK_XOXD in .env, then restart.'
+    ]);
+    savedBox.setLabel(' Later (Unavailable) ');
+    statusBar.setContent(' Status: Later unavailable - re-auth needed (SLACK_XOXC / SLACK_XOXD)');
+    screen.render();
+    return;
+  }
+
+  const result = await fetchSavedItems(50);
+
+  if (!result.ok) {
+    savedEntries = [];
+    savedBox.setItems([
+      `Could not load saved items: ${result.reason}`,
+      'Session credentials may have expired - re-auth and update .env.'
+    ]);
+    savedBox.setLabel(' Later (Error) ');
+    statusBar.setContent(` Status: Later unavailable - ${result.reason}`);
+    screen.render();
+    return;
+  }
+
+  if (result.items.length === 0) {
+    savedEntries = [];
+    renderSavedEntries();
+    screen.render();
+    return;
+  }
+
+  try {
+    savedEntries = await loadSavedMessages(result.items);
+  } catch (error) {
+    savedEntries = [];
+    savedBox.setItems([`Error loading saved messages: ${error.message}`]);
+    savedBox.setLabel(' Later (Error) ');
+    logError('Failed to hydrate saved items', error);
+    screen.render();
+    return;
+  }
+
+  renderSavedEntries();
+  screen.render();
+}
+
 function applyTheme() {
   const theme = getTheme();
   
@@ -3536,6 +3895,9 @@ function applyTheme() {
   if (mentionBox) mentionBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
   if (searchResultsBox) searchResultsBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle, scrollbar: scrollbarStyle };
   if (activityBox) activityBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
+  if (filesBox) filesBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
+  if (savedBox) savedBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
+  if (railBox) railBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
   
   // Update Thread Box
   updateStyle(threadBox, { ...primary, border: borderStyle, scrollbar: scrollbarStyle });
@@ -3570,6 +3932,10 @@ function applyTheme() {
       });
       activityBox.setItems(items);
   }
+
+  if (fileEntries.length > 0) renderFileEntries();
+  if (savedEntries.length > 0) renderSavedEntries();
+  updateRail();
 
   screen.render();
 }

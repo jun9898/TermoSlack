@@ -25,7 +25,8 @@ const userScopes = [
         "files:write",
         "reactions:read",
         "reactions:write",
-        "search:read"
+        "search:read",
+        "stars:read"
 ].join(',');
 
 export function createAuthServer(onSuccess) {

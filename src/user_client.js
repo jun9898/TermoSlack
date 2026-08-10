@@ -702,6 +702,115 @@ export async function getSelfName() {
     return selfName;
 }
 
+export async function listFiles(options = {}) {
+    if (!userClient) return null;
+
+    try {
+        const result = await userClient.files.list({ count: options.count || 50 });
+        const files = result.files || [];
+
+        await prefetchUserNames(new Set(files.map(file => file.user).filter(Boolean)));
+
+        return files.map(file => ({
+            id: file.id,
+            name: file.name || file.title || file.id,
+            title: file.title || file.name || '',
+            filetype: file.filetype || '',
+            size: file.size || 0,
+            user: file.user || '',
+            user_name: file.user ? (userNameCache.get(file.user) || file.user) : 'Unknown',
+            ts: Number(file.timestamp || file.created) || 0,
+            url_private: file.url_private || null,
+            url_private_download: file.url_private_download || null,
+            permalink: file.permalink || null,
+            mimetype: file.mimetype || ''
+        }));
+    } catch (error) {
+        logError('Failed to list files', error);
+        return null;
+    }
+}
+
+async function prefetchConversationLabels(channelIds) {
+    const pending = Array.from(channelIds).filter(channelId => !channelNameCache.has(channelId));
+    if (pending.length === 0) return;
+
+    const dmPeers = new Map();
+
+    await fetchInBatches(pending, async (channelId) => {
+        try {
+            const info = await userClient.conversations.info({ channel: channelId });
+            const channel = info.channel;
+            if (!channel) return;
+            if (channel.is_im && channel.user) {
+                dmPeers.set(channelId, channel.user);
+                return;
+            }
+            if (channel.name) channelNameCache.set(channelId, channel.name);
+        } catch (error) {
+            logError(`Failed to resolve conversation ${channelId}`, error);
+        }
+    });
+
+    if (dmPeers.size === 0) return;
+
+    await prefetchUserNames(new Set(dmPeers.values()));
+    for (const [channelId, userId] of dmPeers) {
+        channelNameCache.set(channelId, userNameCache.get(userId) || userId);
+    }
+}
+
+export async function loadSavedMessages(items) {
+    if (!userClient) {
+        throw new Error('User client not initialized');
+    }
+    if (!Array.isArray(items) || items.length === 0) return [];
+
+    await prefetchConversationLabels(new Set(items.map(item => item.channelId)));
+
+    const fetched = [];
+    for (let i = 0; i < items.length; i += INFO_FETCH_CONCURRENCY) {
+        const batch = items.slice(i, i + INFO_FETCH_CONCURRENCY);
+        const settled = await Promise.allSettled(batch.map(async (item) => {
+            const result = await userClient.conversations.history({
+                channel: item.channelId,
+                latest: item.ts,
+                oldest: item.ts,
+                inclusive: true,
+                limit: 1
+            });
+            return result.messages && result.messages[0] ? result.messages[0] : null;
+        }));
+
+        settled.forEach((entry, index) => {
+            if (entry.status === 'rejected') {
+                logError(`Failed to load saved message ${batch[index].channelId}@${batch[index].ts}`, entry.reason);
+                fetched.push({ item: batch[index], message: null });
+                return;
+            }
+            fetched.push({ item: batch[index], message: entry.value });
+        });
+    }
+
+    const present = fetched.filter(entry => entry.message).map(entry => entry.message);
+    const decorated = await decorateMessages(present);
+
+    let cursor = 0;
+    return fetched.map(entry => {
+        const message = entry.message ? decorated[cursor++] : null;
+        return {
+            channelId: entry.item.channelId,
+            channelName: channelNameCache.get(entry.item.channelId) || entry.item.channelId,
+            ts: entry.item.ts,
+            dateCreated: entry.item.dateCreated,
+            threadTs: message && message.thread_ts && message.thread_ts !== entry.item.ts ? message.thread_ts : null,
+            userName: message ? message.user_name : null,
+            text: message ? message.text : '',
+            missing: !message
+        };
+    });
+}
+
 export async function uploadFile(channelId, filePath, title, threadTs = null) {
     if (!userClient) {
         throw new Error('User client not initialized');
