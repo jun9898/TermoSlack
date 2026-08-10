@@ -988,7 +988,7 @@ export function createUI() {
       userSearchBox.clearValue();
       userSuggestionsBox.hide();
       channelList.focus();
-    } else if (searchMode) {
+    } else if (searchMode || searchQuery) {
       searchMode = false;
       searchQuery = '';
       searchBox.hide();
@@ -1672,6 +1672,14 @@ async function selectChannel(index) {
     currentChannelId = selectedChannel.id;
     const seq = ++channelLoadSeq;
     markChannelRead(selectedChannel.id);
+    if (searchQuery) {
+      searchQuery = '';
+      searchMode = false;
+      searchBox.hide();
+      searchBox.clearValue();
+      updateView();
+      selectChannelRow(selectedChannel.id);
+    }
     const displayName = selectedChannel.is_private
       ? `🔒 ${selectedChannel.name}`
       : selectedChannel.type === 'channel'
