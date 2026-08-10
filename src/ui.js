@@ -2895,7 +2895,7 @@ async function showKittyViewerImage(url, token) {
   if (!isKittyGraphicsEnabled()) return false;
   const buffer = await getImageBuffer(url, token);
   if (!buffer) return false;
-  const placement = prepareKittyViewerImage(buffer, Math.max(1, screen.width - 2), Math.max(1, screen.height - 2));
+  const placement = await prepareKittyViewerImage(buffer, Math.max(1, screen.width - 2), Math.max(1, screen.height - 2));
   if (!placement) return false;
   kittyViewer = placement;
   return true;

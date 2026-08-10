@@ -166,9 +166,10 @@ export function kittyPlaceholderCell(row, col) {
   return PLACEHOLDER + ROWCOLUMN_DIACRITICS[row] + ROWCOLUMN_DIACRITICS[col];
 }
 
-export function prepareKittyViewerImage(buffer, boxCols, boxRows) {
-  if (!enabled || !buffer) return null;
+export async function prepareKittyViewerImage(rawBuffer, boxCols, boxRows) {
+  if (!enabled || !rawBuffer) return null;
   try {
+    const buffer = await toPngBuffer(rawBuffer);
     const size = readPngSize(buffer);
     if (!size) return null;
 
@@ -250,8 +251,23 @@ function write(sequence) {
   }
 }
 
-function transmit(name, buffer) {
-  if (buffer.length < PNG_MAGIC.length || !buffer.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+async function toPngBuffer(buffer) {
+  if (buffer.length >= PNG_MAGIC.length && buffer.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+    return buffer;
+  }
+  const jimpModule = await import('jimp');
+  const Jimp = jimpModule.Jimp || jimpModule.default;
+  const image = await Jimp.fromBuffer(buffer);
+  const out = await image.getBuffer('image/png');
+  return Buffer.isBuffer(out) ? out : Buffer.from(out);
+}
+
+async function transmit(name, rawBuffer) {
+  let buffer;
+  try {
+    buffer = await toPngBuffer(rawBuffer);
+  } catch (error) {
+    logError(`Kitty emoji convert failed: ${name}`, error);
     failed.add(name);
     return false;
   }
@@ -285,7 +301,7 @@ function drainFetchQueue() {
           failed.add(job.name);
           return;
         }
-        if (transmit(job.name, buffer)) readyBatch++;
+        return transmit(job.name, buffer).then(ok => { if (ok) readyBatch++; });
       })
       .catch((error) => {
         logError(`Kitty emoji transmit failed: ${job.name}`, error);
