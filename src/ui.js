@@ -2994,11 +2994,21 @@ function formatReactions(msg, fmt, theme) {
     try { glyph = emojify(`:${r.name}:`); } catch (e) { glyph = `:${r.name}:`; }
     if (glyph === `:${r.name}:`) {
       const resolved = resolveCustomEmoji(r.name);
-      if (resolved?.glyph) glyph = resolved.glyph;
+      if (resolved?.glyph) {
+        glyph = resolved.glyph;
+      } else if (resolved?.url) {
+        if (isKittyGraphicsEnabled()) {
+          const inline = kittyEmojiToken(r.name, resolved.url);
+          if (inline) return `${inline}${theme.tags.time} ${r.count}${theme.tags.reset}`;
+        }
+        const swatch = emojiSwatches.get(r.name);
+        if (swatch === undefined) requestEmojiSwatch(r.name, resolved.url);
+        if (swatch) glyph = `{${swatch}-fg}◪{/}`;
+      }
     }
-    return `${glyph} ${r.count}`;
+    return `${theme.tags.time}${glyph} ${r.count}${theme.tags.reset}`;
   });
-  fmt.rxBody = `${theme.tags.time}${parts.join('   ')}${theme.tags.reset}`;
+  fmt.rxBody = parts.join('   ');
   return fmt.rxBody;
 }
 
