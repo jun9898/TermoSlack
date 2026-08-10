@@ -1741,14 +1741,14 @@ function startMessagePolling() {
 function updateBorders() {
   const theme = getTheme();
   const accent = theme.focusBorder || 'yellow';
+  const base = theme.border || {};
   const panels = [channelList, chatBox, threadBox, activityBox, input];
 
   for (const panel of panels) {
-    if (!panel || !panel.style || !panel.style.border) continue;
+    if (!panel || !panel.style) continue;
     const focused = screen && screen.focused === panel;
-    panel.style.border.fg = focused ? accent : theme.border.fg;
-    panel.style.border.bold = focused;
-    if (panel.style.label) panel.style.label.fg = focused ? accent : theme.border.fg;
+    panel.style.border = focused ? { ...base, fg: accent, bold: true } : { ...base };
+    panel.style.label = focused ? { fg: accent, bg: base.bg, bold: true } : { fg: base.fg, bg: base.bg };
   }
 
   if (screen) screen.render();
