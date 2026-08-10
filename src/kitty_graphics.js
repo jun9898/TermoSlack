@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import { getImageBuffer } from './image_cache.js';
 import { logInfo, logError } from './logger.js';
 
@@ -61,7 +62,18 @@ function outerTerminalSupported(env) {
   if (env.KITTY_WINDOW_ID) return true;
   if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) return true;
   if (env.TERM_PROGRAM === 'ghostty') return true;
-  return /kitty|ghostty/i.test(env.TERM || '');
+  if (/kitty|ghostty/i.test(env.TERM || '')) return true;
+  if (isInsideTmux(env)) return tmuxClientSupported();
+  return false;
+}
+
+function tmuxClientSupported() {
+  try {
+    const clients = execSync('tmux list-clients -F "#{client_termname}"', { timeout: 2000 }).toString();
+    return /kitty|ghostty/i.test(clients);
+  } catch (error) {
+    return false;
+  }
 }
 
 export function detectKittyGraphics(env = process.env) {
@@ -82,7 +94,10 @@ export function initKittyGraphics(screen, getToken) {
   tokenProvider = null;
 
   try {
-    if (!detectKittyGraphics()) return false;
+    if (!detectKittyGraphics()) {
+      logInfo(`Kitty graphics disabled: not detected (TERM=${process.env.TERM}, TMUX=${process.env.TMUX ? 'yes' : 'no'})`);
+      return false;
+    }
     if (!screen?.program?.output?.writable) return false;
     const colors = screen.program.tput?.colors ?? 0;
     if (colors < 256) {
