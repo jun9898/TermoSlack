@@ -1,5 +1,7 @@
 import blessed from 'neo-blessed';
-import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName, seedUserNames } from './user_client.js';
+import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName, seedUserNames, editMessage, deleteMessage, addReaction, getPermalink } from './user_client.js';
+import { exec } from 'child_process';
+import open from 'open';
 import { logInfo, logError } from './logger.js';
 import { getCachedImage } from './image_cache.js';
 import { deleteSession } from './storage.js';
@@ -7,8 +9,44 @@ import { pickFile, clipboardImagePath } from './file_picker.js';
 import { emojify } from 'node-emoji';
 import { getTheme, cycleTheme } from './themes.js';
 
+patchEmojiWidth();
+
+function patchEmojiWidth() {
+  const unicode = blessed.unicode;
+  if (!unicode || unicode.termoslackEmojiWidth) return;
+  unicode.termoslackEmojiWidth = true;
+
+  const wideCache = new Map();
+  const isWideEmoji = (point) => {
+    let wide = wideCache.get(point);
+    if (wide === undefined) {
+      wide = /\p{Emoji_Presentation}/u.test(String.fromCodePoint(point));
+      wideCache.set(point, wide);
+    }
+    return wide;
+  };
+
+  const baseCharWidth = unicode.charWidth;
+  unicode.charWidth = function (str, i) {
+    const point = typeof str === 'number' ? str : unicode.codePointAt(str, i || 0);
+    if (point >= 0x2000) {
+      if (isWideEmoji(point)) return 2;
+      if (typeof str === 'string' && str.codePointAt((i || 0) + (point > 0xffff ? 2 : 1)) === 0xfe0f) return 2;
+    }
+    return baseCharWidth.call(this, str, i);
+  };
+
+  const inner = (regex) => regex.source.replace(/^\(/, '').replace(/\)$/, '');
+  unicode.chars.all = new RegExp(
+    '(' + inner(unicode.chars.swide)
+      + '|' + inner(unicode.chars.wide)
+      + '|\\p{Emoji_Presentation}\\uFE0F?'
+      + '|\\p{Extended_Pictographic}\\uFE0F'
+      + ')', 'gu');
+}
+
 let screen, channelList, chatBox, input, header, statusBar, navbar, channelsBtn, dmsBtn, searchBox, joinBox, imageViewer, suggestionsBox;
-let globalSearchBox, searchResultsBox, threadBox, userSearchBox, userSuggestionsBox;
+let globalSearchBox, searchResultsBox, threadBox, userSearchBox, userSuggestionsBox, mentionBox, reactionBox;
 let channels = [];
 let sections = null;
 let displayRows = [];
@@ -45,6 +83,24 @@ let currentUserSearchId = 0;
 let allWorkspaceUsers = [];
 let isUsersFullyLoaded = false;
 let customEmojis = {};
+let mentionUsers = null;
+let mentionUsersSize = -1;
+let mentionChannels = null;
+let mentionChannelsSource = null;
+let mentionMatches = [];
+let mentionToken = null;
+let mentionRefreshScheduled = false;
+let selfUserId = null;
+let editingTs = null;
+let reactionTargetTs = null;
+let historyLoadInFlight = false;
+let historyExhaustedChannelId = null;
+let submitInput = null;
+let inputLineCount = 1;
+
+const MENTION_SUGGESTION_LIMIT = 5;
+const MAX_INPUT_LINES = 4;
+const NEWLINE_SEQUENCES = ['\x1b\r', '\x1b\n', '\x1b[13;2u', '\x1b[13;3u', '\x1b[27;2;13~'];
 
 const MAX_LOADED_MESSAGES = 300;
 
@@ -157,15 +213,51 @@ export function createUI() {
   });
 
   // Input Box
-  input = blessed.textbox({
+  input = blessed.textarea({
     bottom: 3,
     left: '25%',
     width: '75%',
     height: 3,
-    label: ' Type message (Tab to focus, Enter to send) ',
+    label: ' Type message (Enter to send, Alt+Enter for newline) ',
     inputOnFocus: true,
     style:{
       ...getTheme().input,
+      border: getTheme().border
+    },
+    border: {
+      type: 'line'
+    }
+  });
+
+  reactionBox = blessed.textbox({
+    bottom: 3,
+    left: '25%',
+    width: '40%',
+    height: 3,
+    label: ' Emoji name (Enter to add, Esc to cancel) ',
+    inputOnFocus: true,
+    hidden: true,
+    style: {
+      ...getTheme().primary,
+      border: getTheme().border
+    },
+    border: {
+      type: 'line'
+    }
+  });
+
+  mentionBox = blessed.list({
+    bottom: 6,
+    left: '25%',
+    width: '40%',
+    height: 7,
+    label: ' Tab to insert ',
+    hidden: true,
+    tags: true,
+    style: {
+      ...getTheme().primary,
+      item: getTheme().item,
+      selected: getTheme().selected,
       border: getTheme().border
     },
     border: {
@@ -455,6 +547,8 @@ export function createUI() {
   screen.append(suggestionsBox);
   screen.append(userSearchBox);
   screen.append(userSuggestionsBox);
+  screen.append(mentionBox);
+  screen.append(reactionBox);
 
   // Global Search Box (hidden by default)
 
@@ -651,28 +745,36 @@ export function createUI() {
   });
 
   // F1 - Switch to Channels view
-  screen.key(['f1'], () => {
+  screen.key(['f1', '1'], () => {
+    if (isTyping()) return;
     currentView = 'channels';
     updateView();
     updateButtonStyles();
+    screen.render();
   });
 
   // F2 - Switch to DMs view
-  screen.key(['f2'], () => {
+  screen.key(['f2', '2'], () => {
+    if (isTyping()) return;
     currentView = 'dms';
     updateView();
     updateButtonStyles();
+    screen.render();
   });
 
   // F3 - Toggle Activity View
-  screen.key(['f3'], async () => {
+  screen.key(['f3', '3'], async () => {
+    if (isTyping()) return;
     if (currentView === 'activity') {
       currentView = 'channels'; // Default back to channels
       updateView();
       updateButtonStyles();
+      screen.render();
     } else {
       currentView = 'activity';
       updateView();
+      updateButtonStyles();
+      screen.render();
       await loadActivity();
     }
   });
@@ -721,10 +823,10 @@ export function createUI() {
 
   // Tab - Cycle focus: channels -> messages -> input -> channels
   screen.key(['tab'], () => {
+    if (!mentionBox.hidden) return;
     if (threadMode) {
       if (threadBox.focused) input.focus();
       else threadBox.focus();
-      screen.render();
       return;
     }
     if (channelList.focused) {
@@ -735,7 +837,6 @@ export function createUI() {
     } else {
       channelList.focus();
     }
-    screen.render();
   });
 
   // Enter - Focus chat area for message navigation
@@ -748,6 +849,10 @@ export function createUI() {
   // Arrow keys for scrolling messages
   screen.key(['up', 'k'], () => {
     if (chatBox.focused && messages.length > 0) {
+      if (selectedMessageIndex === 0) {
+        loadMoreMessages();
+        return;
+      }
       // UP = go to older messages (decrease index, move up visually)
       if (selectedMessageIndex > 0) {
         selectedMessageIndex--;
@@ -778,9 +883,120 @@ export function createUI() {
 
   // Page Up - Load more messages (3-4 days of history)
   screen.key(['pageup'], async () => {
-    if (chatBox.focused && currentChannelId) {
+    if (isTyping() || channelList.focused || threadMode) return;
+    if (currentChannelId) {
       await loadMoreMessages();
     }
+  });
+
+  screen.key(['C-l'], () => {
+    screen.realloc();
+    screen.render();
+  });
+
+  screen.key(['e'], () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+    if (!isOwnMessage(msg)) {
+      statusBar.setContent(' Status: You can only edit your own messages');
+      screen.render();
+      return;
+    }
+    editingTs = msg.ts;
+    input.setValue(msg.raw_text || msg.text || '');
+    focusWidget(input);
+    statusBar.setContent(' Status: Editing - Enter to save, Esc to cancel');
+    screen.render();
+  });
+
+  screen.key(['d'], () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+    if (!isOwnMessage(msg)) {
+      statusBar.setContent(' Status: You can only delete your own messages');
+      screen.render();
+      return;
+    }
+    const channelId = currentChannelId;
+    askConfirmation('Delete this message?', async (confirmed) => {
+      focusWidget(chatBox);
+      if (!confirmed) return;
+      try {
+        await deleteMessage(channelId, msg.ts);
+        const index = messages.findIndex(m => m.ts === msg.ts);
+        if (index >= 0) {
+          messages.splice(index, 1);
+          if (selectedMessageIndex >= messages.length) selectedMessageIndex = messages.length - 1;
+        }
+        displayMessages(messages);
+        statusBar.setContent(' Status: Message deleted');
+      } catch (error) {
+        statusBar.setContent(` Status: Delete failed - ${error.message}`);
+        logError('Failed to delete message', error);
+      }
+      screen.render();
+    });
+  });
+
+  screen.key(['r'], () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+    reactionTargetTs = msg.ts;
+    reactionBox.clearValue();
+    reactionBox.show();
+    reactionBox.setFront();
+    focusWidget(reactionBox);
+    screen.render();
+  });
+
+  screen.key(['y'], async () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+    try {
+      const link = await getPermalink(currentChannelId, msg.ts);
+      await copyToClipboard(link);
+      statusBar.setContent(' Status: Link copied');
+    } catch (error) {
+      statusBar.setContent(` Status: Copy failed - ${error.message}`);
+      logError('Failed to copy permalink', error);
+    }
+    screen.render();
+  });
+
+  screen.key(['u'], async () => {
+    if (isTyping()) return;
+    const msg = selectedMessage();
+    if (!msg) return;
+    const url = firstUrl(msg.raw_text || msg.text || '');
+    if (!url) {
+      statusBar.setContent(' Status: No link in this message');
+      screen.render();
+      return;
+    }
+    try {
+      await open(url);
+      statusBar.setContent(` Status: Opened ${url}`);
+    } catch (error) {
+      statusBar.setContent(` Status: Could not open link - ${error.message}`);
+      logError('Failed to open URL', error);
+    }
+    screen.render();
+  });
+
+  screen.key(['C-j'], (ch, key) => {
+    if (key) key.name = 'unreadjump';
+    if (isTyping() || !channelList.focused) return;
+    jumpToUnread(1);
+  });
+
+  screen.key(['C-k'], (ch, key) => {
+    if (key) key.name = 'unreadjump';
+    if (isTyping() || !channelList.focused) return;
+    jumpToUnread(-1);
   });
 
   // Ctrl+F or / - Activate search
@@ -929,8 +1145,8 @@ export function createUI() {
     });
   });
 
-  // Ctrl+J or F7 - Join channel
-  screen.key(['C-j', 'f7'], async () => {
+  // F7 - Join channel
+  screen.key(['f7'], async () => {
     if (!joinMode) {
       // Close other modes if active to prevent overlap
       if (searchMode) { searchMode = false; searchBox.hide(); }
@@ -1118,7 +1334,11 @@ export function createUI() {
 
   channelList.on('keypress', (ch, key) => {
     if (!key) return;
-    if (key.name === 'up' || key.name === 'k') {
+    if (key.name === 'pageup' || key.name === 'pagedown') {
+      pageChannelSelection(key.name === 'pagedown' ? 1 : -1);
+    } else if (key.name === 'g') {
+      if (moveOffSectionHeader(key.shift ? -1 : 1)) screen.render();
+    } else if (key.name === 'up' || key.name === 'k') {
       if (moveOffSectionHeader(-1)) screen.render();
     } else if (key.name === 'down' || key.name === 'j') {
       if (moveOffSectionHeader(1)) screen.render();
@@ -1142,20 +1362,79 @@ export function createUI() {
       screen.render();
     }
   });
+  input.on('keypress', (ch, key) => {
+    if (!key) return;
+
+    if (key.name === 'pageup' || key.name === 'pagedown') {
+      const direction = key.name === 'pagedown' ? 1 : -1;
+      key.name = 'return';
+      pageChatFromInput(direction);
+      return;
+    }
+
+    if (key.name === 'enter') {
+      key.name = 'return';
+      if (!mentionBox.hidden && applyMentionSelection()) {
+        syncInputHeight();
+        screen.render();
+        return;
+      }
+      const value = input.getValue();
+      submitInput(value);
+      return;
+    }
+
+    if (!mentionBox.hidden) {
+      if (key.name === 'tab' && applyMentionSelection()) {
+        key.name = 'return';
+        screen.render();
+        return;
+      }
+      if (key.name === 'down' || key.name === 'up') {
+        if (key.name === 'down') mentionBox.down();
+        else mentionBox.up();
+        key.name = 'return';
+        screen.render();
+        return;
+      }
+      if (key.name === 'escape') {
+        hideMentionBox();
+        key.name = 'return';
+        screen.render();
+        return;
+      }
+    }
+
+    scheduleMentionRefresh();
+  });
+
+  input.on('blur', () => {
+    if (mentionBox.hidden) return;
+    hideMentionBox();
+    screen.render();
+  });
+
   // Message input submission
-  input.on('submit', async (value) => {
+  submitInput = async (value) => {
+    hideMentionBox();
+
+    if (editingTs) {
+      await saveEdit(value);
+      return;
+    }
+
     if (!currentChannelId) {
       statusBar.setContent(' Status: Please select a channel first');
       statusBar.style.fg = 'red';
-      screen.render();
       input.clearValue();
-      input.focus();
+      syncInputHeight();
+      screen.render();
       return;
     }
 
     const text = value.trim();
     input.clearValue();
-    input.focus();
+    syncInputHeight();
 
     if (!text) {
       screen.render();
@@ -1166,8 +1445,10 @@ export function createUI() {
     const sentInThread = threadMode;
     const pending = {
       ts: String(Date.now() / 1000),
+      user: selfUserId,
       user_name: selfDisplayName || 'Me',
       text,
+      raw_text: text,
       pending: true,
       has_images: false,
       image_files: []
@@ -1190,7 +1471,7 @@ export function createUI() {
       }).catch(() => {});
     }
 
-    sendMessage(currentChannelId, text, threadTs)
+    sendMessage(currentChannelId, resolveMentions(text), threadTs)
       .then(result => {
         pending.ts = result.ts || pending.ts;
         pending.pending = false;
@@ -1215,6 +1496,49 @@ export function createUI() {
         screen.render();
         logError(`Failed to send message to channel ${currentChannelId}`, error);
       });
+  };
+
+  reactionBox.on('submit', async (value) => {
+    const name = (value || '').trim().replace(/^:|:$/g, '');
+    const ts = reactionTargetTs;
+    reactionBox.hide();
+    reactionBox.clearValue();
+    reactionTargetTs = null;
+    focusWidget(chatBox);
+
+    if (!name || !ts) {
+      screen.render();
+      return;
+    }
+
+    try {
+      await addReaction(currentChannelId, ts, name);
+      const msg = messages.find(m => m.ts === ts);
+      if (msg) {
+        const existing = (msg.reactions || []).find(r => r.name === name);
+        if (existing) existing.count += 1;
+        else msg.reactions = (msg.reactions || []).concat({ name, count: 1 });
+        if (msg._fmt) msg._fmt.rxSig = null;
+        displayMessages(messages);
+      }
+      statusBar.setContent(` Status: Reacted :${name}:`);
+    } catch (error) {
+      const code = error?.data?.error || error.message || '';
+      if (String(code).includes('missing_scope')) {
+        statusBar.setContent(' Status: 재인증 필요 (reactions scope) - Ctrl+Q 후 다시 로그인');
+      } else {
+        statusBar.setContent(` Status: Reaction failed - ${code}`);
+      }
+      logError('Failed to add reaction', error);
+    }
+    screen.render();
+  });
+
+  reactionBox.on('cancel', () => {
+    reactionBox.hide();
+    reactionBox.clearValue();
+    reactionTargetTs = null;
+    focusWidget(chatBox);
   });
 
   // Search box handlers
@@ -1721,12 +2045,14 @@ export function createUI() {
   });
 
   input.on('cancel', () => {
-    if (threadMode) {
-      threadBox.focus();
-    } else {
-      chatBox.focus();
+    hideMentionBox();
+    if (editingTs) {
+      editingTs = null;
+      input.clearValue();
+      statusBar.setContent(' Status: Edit cancelled');
     }
-    screen.render();
+    if (screen.focused === input) return;
+    focusWidget(threadMode ? threadBox : chatBox);
   });
 
   chatBox.on('focus', () => {
@@ -1739,9 +2065,11 @@ export function createUI() {
     screen.render();
   });
 
+  installNewlineKeys();
   updateBorders();
   startMessagePolling();
   getSelfName().then(name => { selfDisplayName = name; }).catch(() => {});
+  getCurrentUserId().then(id => { selfUserId = id; }).catch(() => {});
 
   // Start caching users in background
   preloadUsers();
@@ -1753,6 +2081,7 @@ async function selectChannel(index) {
   const selectedChannel = displayRows[index];
   if (selectedChannel) {
     currentChannelId = selectedChannel.id;
+    historyExhaustedChannelId = null;
     const seq = ++channelLoadSeq;
     markChannelRead(selectedChannel.id);
     if (searchQuery) {
@@ -1793,6 +2122,7 @@ async function selectChannel(index) {
 
 function isTyping() {
   if (searchMode || globalSearchMode || userSearchMode || joinMode) return true;
+  if (reactionBox && reactionBox.focused) return true;
   return !!(input && input.focused);
 }
 
@@ -1859,22 +2189,19 @@ function updateBorders() {
     panel.style.border = focused ? { ...base, fg: accent, bold: true } : { ...base };
     panel.style.label = focused ? { fg: accent, bg: base.bg, bold: true } : { fg: base.fg, bg: base.bg };
   }
-
-  if (screen) screen.render();
 }
 
 function updateButtonStyles() {
   if (currentView === 'channels') {
-    channelsBtn.setContent('{center}> [F1] Channels | [Ctrl+F] Search | [F7] Join <{/center}');
-    dmsBtn.setContent('{center}[F2] DMs | [Ctrl+U] Upload | [Ctrl+Q] Logout{/center}');
+    channelsBtn.setContent('{center}> [1] Channels | [Ctrl+F] Search | [F7] Join <{/center}');
+    dmsBtn.setContent('{center}[2] DMs | [3] Activity | [Ctrl+U] Upload | [Ctrl+Q] Logout{/center}');
   } else if (currentView === 'dms') {
-    channelsBtn.setContent('{center}[F1] Channels{/center}');
-    dmsBtn.setContent('{center}> [F2] DMs | [Ctrl+U] Upload | [F3] Activity | [Ctrl+Q] Logout <{/center}');
+    channelsBtn.setContent('{center}[1] Channels{/center}');
+    dmsBtn.setContent('{center}> [2] DMs | [Ctrl+U] Upload | [3] Activity | [Ctrl+Q] Logout <{/center}');
   } else if (currentView === 'activity') {
-    channelsBtn.setContent('{center}[F1] Channels{/center}');
-    dmsBtn.setContent('{center}[F2] DMs | > [F3] Activity < | [Ctrl+Q] Logout{/center}');
+    channelsBtn.setContent('{center}[1] Channels{/center}');
+    dmsBtn.setContent('{center}[2] DMs | > [3] Activity < | [Ctrl+Q] Logout{/center}');
   }
-  screen.render();
 }
 
 function mutedTag() {
@@ -1894,10 +2221,11 @@ function unreadDot(unread) {
 
 function formatChannelItem(ch) {
   const prefix = ch.is_private ? '🔒 ' : '# ';
-  if (!hasUnreadData) return '  ' + prefix + ch.name;
+  const name = normalizeName(ch.name);
+  if (!hasUnreadData) return '  ' + prefix + name;
 
   const unread = unreads.get(ch.id);
-  const label = ch.name + mentionBadge(unread);
+  const label = name + mentionBadge(unread);
   if (unread) return `${unreadDot(unread)}${prefix}{bold}${label}{/bold}`;
 
   const muted = mutedTag();
@@ -1905,10 +2233,11 @@ function formatChannelItem(ch) {
 }
 
 function formatDMItem(ch) {
-  if (!hasUnreadData) return '  💬 {bold}' + ch.name + '{/bold}';
+  const name = normalizeName(ch.name);
+  if (!hasUnreadData) return '  💬 {bold}' + name + '{/bold}';
 
   const unread = unreads.get(ch.id);
-  const label = ch.name + mentionBadge(unread);
+  const label = name + mentionBadge(unread);
   if (unread) return `${unreadDot(unread)}💬 {bold}${label}{/bold}`;
 
   const muted = mutedTag();
@@ -2007,12 +2336,13 @@ function updateView() {
     activityBox.show();
     activityBox.focus();
     statusBar.setContent(' Status: Viewing Activity (Enter to jump to message)');
-    screen.render();
+    updateBorders();
     return;
   } else {
     activityBox.hide();
+    if (!threadMode && !globalSearchMode && chatBox.hidden) chatBox.show();
   }
-  
+
   if (currentView === 'channels') {
     channelList.setLabel(' Channels ');
     filteredChannels = channels.filter(ch => ch.type === 'channel');
@@ -2054,14 +2384,13 @@ function updateView() {
     statusBar.setContent(statusText);
   }
   
-  channelList.focus();
+  if (screen && (!screen.focused || screen.focused.hidden)) channelList.focus();
   updateBorders();
-  screen.render();
 }
 
 export function setChannels(channelData) {
   channels = channelData;
-  updateView(); // Apply current view filter
+  refreshChannelList();
 }
 
 function refreshChannelList() {
@@ -2075,7 +2404,7 @@ function refreshChannelList() {
   selectChannelRow(cursorChannelId);
   moveOffSectionHeader(1);
 
-  if (previouslyFocused && previouslyFocused !== channelList && typeof previouslyFocused.focus === 'function') {
+  if (previouslyFocused && screen.focused !== previouslyFocused && typeof previouslyFocused.focus === 'function') {
     previouslyFocused.focus();
   }
   if (screen) screen.render();
@@ -2218,11 +2547,17 @@ function formatReactions(msg, fmt, theme) {
   return fmt.rxBody;
 }
 
+function applyBold(text) {
+  if (!text || text.indexOf('*') === -1) return text;
+  return text.replace(/(^|[\s([{<"'“‘])\*(?![\s*])([^*\n]*[^\s*])\*(?=$|[\s)\]}>"'”’.,!?;:])/g,
+    (match, lead, body) => `${lead}{bold}${body}{/bold}`);
+}
+
 function messageTextCache(msg, contentWidth, theme) {
   let fmt = msg._fmt;
   if (fmt && fmt.width === contentWidth && fmt.theme === theme) return fmt;
 
-  let escapedText = escapeText(processText(msg.text || ''));
+  let escapedText = applyBold(escapeText(processText(msg.text || '')));
 
   if (msg.files && msg.files.length > 0) {
     const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
@@ -2327,7 +2662,8 @@ function displayMessages(msgs) {
     const target = Number.isFinite(viewportHeight)
       ? selectedTop - Math.floor((viewportHeight - selectedHeight) / 2)
       : selectedTop;
-    chatBox.scrollTo(Math.max(0, target));
+    const maxScroll = Math.max(0, chatBox.getScrollHeight() - Math.max(1, viewportHeight));
+    chatBox.scrollTo(Math.min(Math.max(0, target), maxScroll));
   }
 
   screen.render();
@@ -2370,13 +2706,12 @@ function closeThread() {
 }
 
 function focusChatArea() {
-  chatBox.focus();
   // Initialize selected message when focusing chat
   if (messages.length > 0 && selectedMessageIndex === -1) {
     selectedMessageIndex = messages.length - 1; // Select most recent (bottom)
     displayMessages(messages);
   }
-  screen.render();
+  chatBox.focus();
 }
 
 async function openSelectedThread() {
@@ -2498,13 +2833,22 @@ function displaySearchResults(results, query) {
 }
 
 async function loadMoreMessages() {
-  if (!currentChannelId) return;
+  if (!currentChannelId || historyLoadInFlight) return;
+
+  if (historyExhaustedChannelId === currentChannelId) {
+    statusBar.setContent(' Status: No more messages to load');
+    screen.render();
+    return;
+  }
 
   if (messages.length >= MAX_LOADED_MESSAGES) {
     statusBar.setContent(` Status: History limit reached (${MAX_LOADED_MESSAGES} messages loaded)`);
     screen.render();
     return;
   }
+
+  historyLoadInFlight = true;
+  const loadingChannelId = currentChannelId;
 
   try {
     statusBar.setContent(' Status: Loading more messages...');
@@ -2531,6 +2875,7 @@ async function loadMoreMessages() {
       statusBar.setContent(` Status: Loaded ${prepended.length} more messages`);
       logInfo(`Loaded ${prepended.length} older messages`);
     } else {
+      historyExhaustedChannelId = loadingChannelId;
       statusBar.setContent(' Status: No more messages to load');
     }
 
@@ -2539,6 +2884,8 @@ async function loadMoreMessages() {
     statusBar.setContent(` Status: Error loading messages - ${error.message}`);
     logError('Failed to load more messages', error);
     screen.render();
+  } finally {
+    historyLoadInFlight = false;
   }
 }
 
@@ -2606,6 +2953,350 @@ export function setReloadChannelsCallback(callback) {
   reloadChannelsCallback = callback;
 }
 
+function syncInputHeight() {
+  const lines = Math.min(MAX_INPUT_LINES, Math.max(1, input.getValue().split('\n').length));
+  if (lines === inputLineCount) return;
+
+  inputLineCount = lines;
+  const extra = lines - 1;
+  input.height = 3 + extra;
+  chatBox.height = `100%-${9 + extra}`;
+  mentionBox.bottom = 6 + extra;
+}
+
+function insertInputNewline() {
+  if (!input || !input.focused) return false;
+
+  input.setValue(`${input.getValue()}\n`);
+  hideMentionBox();
+  syncInputHeight();
+  screen.render();
+  return true;
+}
+
+function findNewlineSequence(chunk) {
+  for (const sequence of NEWLINE_SEQUENCES) {
+    const index = chunk.indexOf(sequence);
+    if (index !== -1) return { index, length: Buffer.byteLength(sequence) };
+  }
+  return null;
+}
+
+function stripNewlineSequences(chunk) {
+  let rest = chunk;
+  let count = 0;
+  const parts = [];
+
+  for (;;) {
+    const hit = findNewlineSequence(rest);
+    if (!hit) break;
+    parts.push(rest.subarray(0, hit.index));
+    rest = rest.subarray(hit.index + hit.length);
+    count++;
+  }
+
+  if (count === 0) return { chunk, count };
+  parts.push(rest);
+  return { chunk: Buffer.concat(parts), count };
+}
+
+function installNewlineKeys() {
+  const stream = screen.program.input;
+  if (!stream || stream.__newlineKeysInstalled) return;
+  stream.__newlineKeysInstalled = true;
+
+  const originalEmit = stream.emit.bind(stream);
+  stream.emit = function (type, ...args) {
+    if (type !== 'data' || !Buffer.isBuffer(args[0])) return originalEmit(type, ...args);
+
+    const { chunk, count } = stripNewlineSequences(args[0]);
+    if (count === 0) return originalEmit(type, ...args);
+
+    for (let i = 0; i < count; i++) insertInputNewline();
+    if (chunk.length === 0) return true;
+    return originalEmit(type, chunk, ...args.slice(1));
+  };
+}
+
+function focusWidget(widget) {
+  if (!widget || !screen || screen.focused === widget) return;
+
+  const current = screen.focused;
+  if (current && current._reading && typeof current.cancel === 'function') current.cancel();
+
+  if (screen.focused !== widget) widget.focus();
+}
+
+function selectedMessage() {
+  if (!chatBox || !chatBox.focused) return null;
+  if (selectedMessageIndex < 0 || selectedMessageIndex >= messages.length) return null;
+  return messages[selectedMessageIndex] || null;
+}
+
+function isOwnMessage(msg) {
+  return !!(msg && selfUserId && msg.user === selfUserId);
+}
+
+function firstUrl(text) {
+  const match = /(https?:\/\/[^\s<>|)\]]+)/.exec(text || '');
+  return match ? match[1] : null;
+}
+
+function copyToClipboard(text) {
+  return new Promise((resolve, reject) => {
+    const child = exec('pbcopy', (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+    child.stdin.end(text);
+  });
+}
+
+async function saveEdit(value) {
+  const ts = editingTs;
+  const text = (value || '').trim();
+  editingTs = null;
+  input.clearValue();
+  focusWidget(chatBox);
+
+  if (!text) {
+    statusBar.setContent(' Status: Edit cancelled (empty message)');
+    screen.render();
+    return;
+  }
+
+  try {
+    await editMessage(currentChannelId, ts, resolveMentions(text));
+    const msg = messages.find(m => m.ts === ts);
+    if (msg) {
+      msg.text = text;
+      msg.raw_text = text;
+      msg._fmt = null;
+      displayMessages(messages);
+    }
+    statusBar.setContent(' Status: Message edited');
+    logInfo(`Message ${ts} edited in ${currentChannelId}`);
+  } catch (error) {
+    statusBar.setContent(` Status: Edit failed - ${error.message}`);
+    logError('Failed to edit message', error);
+  }
+  screen.render();
+}
+
+function pageChatFromInput(direction) {
+  if (!currentChannelId || threadMode) return;
+  if (direction < 0) {
+    loadMoreMessages();
+    return;
+  }
+  const page = Math.max(1, Number(chatBox.height) - 2);
+  chatBox.scroll(page);
+  screen.render();
+}
+
+function selectableRow(start, direction) {
+  for (let i = start; i >= 0 && i < displayRows.length; i += direction) {
+    if (displayRows[i]) return i;
+  }
+  return -1;
+}
+
+function pageChannelSelection(direction) {
+  if (displayRows.length === 0) return;
+  const page = Math.max(1, Number(channelList.height) - 2);
+  const current = channelList.selected || 0;
+  const bounded = Math.min(displayRows.length - 1, Math.max(0, current + page * direction));
+  const target = selectableRow(bounded, direction) >= 0
+    ? selectableRow(bounded, direction)
+    : selectableRow(bounded, -direction);
+
+  if (target >= 0) {
+    channelList.select(target);
+    screen.render();
+  }
+}
+
+function jumpToUnread(direction) {
+  if (displayRows.length === 0) return;
+  const current = channelList.selected || 0;
+
+  for (let i = current + direction; i >= 0 && i < displayRows.length; i += direction) {
+    const row = displayRows[i];
+    if (row && unreads.has(row.id)) {
+      channelList.select(i);
+      statusBar.setContent(` Status: ${row.name}`);
+      screen.render();
+      return;
+    }
+  }
+
+  statusBar.setContent(` Status: No unread ${direction > 0 ? 'below' : 'above'}`);
+  screen.render();
+}
+
+function normalizeName(value) {
+  return typeof value === 'string' ? value.normalize('NFC') : value;
+}
+
+function mentionUserData() {
+  if (mentionUsers && mentionUsersSize === allWorkspaceUsers.length) return mentionUsers;
+
+  const items = [];
+  const lookup = new Map();
+  const seen = new Set();
+
+  for (const user of allWorkspaceUsers) {
+    const label = normalizeName(user.profile?.display_name || user.real_name || user.name);
+    if (label && !seen.has(label)) {
+      seen.add(label);
+      items.push({ label, lower: label.toLowerCase(), hint: user.name });
+    }
+    for (const alias of [label, user.real_name, user.profile?.real_name, user.name]) {
+      const key = normalizeName(alias);
+      if (key && !lookup.has(key)) lookup.set(key, user.id);
+    }
+  }
+
+  mentionUsers = { items, lookup };
+  mentionUsersSize = allWorkspaceUsers.length;
+  return mentionUsers;
+}
+
+function mentionChannelData() {
+  if (mentionChannels && mentionChannelsSource === channels) return mentionChannels;
+
+  const items = [];
+  const lookup = new Map();
+
+  for (const ch of channels) {
+    if (ch.type !== 'channel' || !ch.name) continue;
+    const label = normalizeName(ch.name);
+    items.push({ label, lower: label.toLowerCase(), hint: ch.is_private ? 'private' : '' });
+    if (!lookup.has(label)) lookup.set(label, ch.id);
+  }
+
+  mentionChannels = { items, lookup };
+  mentionChannelsSource = channels;
+  return mentionChannels;
+}
+
+function currentMentionToken(value) {
+  const match = /(^|\s)([@#])([^\s@#]*)$/.exec(normalizeName(value) || '');
+  if (!match) return null;
+  return { trigger: match[2], query: match[3], start: match.index + match[1].length };
+}
+
+function hideMentionBox() {
+  mentionToken = null;
+  mentionMatches = [];
+  if (mentionBox && !mentionBox.hidden) mentionBox.hide();
+}
+
+function refreshMentionSuggestions() {
+  if (!input || !input.focused) {
+    hideMentionBox();
+    return;
+  }
+
+  const token = currentMentionToken(input.getValue());
+  if (!token) {
+    hideMentionBox();
+    return;
+  }
+
+  const data = token.trigger === '@' ? mentionUserData() : mentionChannelData();
+  const query = normalizeName(token.query).toLowerCase();
+  const matches = [];
+  for (const item of data.items) {
+    if (query && !item.lower.startsWith(query)) continue;
+    matches.push(item);
+    if (matches.length === MENTION_SUGGESTION_LIMIT) break;
+  }
+
+  if (matches.length === 0) {
+    hideMentionBox();
+    return;
+  }
+
+  mentionToken = token;
+  mentionMatches = matches;
+  mentionBox.setItems(matches.map(item => {
+    const alias = item.hint && item.hint !== item.label ? ` (@${escapeText(item.hint)})` : '';
+    return `${token.trigger}${escapeText(item.label)}${alias}`;
+  }));
+  mentionBox.select(0);
+  mentionBox.show();
+  mentionBox.setFront();
+}
+
+function scheduleMentionRefresh() {
+  if (mentionRefreshScheduled) return;
+  mentionRefreshScheduled = true;
+  setImmediate(() => {
+    mentionRefreshScheduled = false;
+    const wasVisible = !mentionBox.hidden;
+    const heightBefore = inputLineCount;
+    refreshMentionSuggestions();
+    syncInputHeight();
+    if (wasVisible || !mentionBox.hidden || heightBefore !== inputLineCount) screen.render();
+  });
+}
+
+function applyMentionSelection() {
+  if (!mentionToken || mentionMatches.length === 0) return false;
+
+  const choice = mentionMatches[mentionBox.selected] || mentionMatches[0];
+  const value = normalizeName(input.getValue());
+  const completed = `${value.slice(0, mentionToken.start)}${mentionToken.trigger}${choice.label} `;
+
+  hideMentionBox();
+  input.setValue(completed);
+  return true;
+}
+
+function longestMentionMatch(text, start, lookup) {
+  const parts = text.slice(start).split(/(\s+)/);
+  let candidate = '';
+  let best = null;
+
+  for (let i = 0; i < parts.length && i < 9; i++) {
+    candidate += parts[i];
+    if (!parts[i] || /^\s+$/.test(parts[i])) continue;
+    const trimmed = candidate.replace(/[.,!?;:)\]}'"]+$/, '');
+    if (lookup.has(candidate)) best = candidate;
+    else if (trimmed && lookup.has(trimmed)) best = trimmed;
+  }
+
+  return best;
+}
+
+function resolveMentions(rawText) {
+  const text = normalizeName(rawText);
+  if (!text || (text.indexOf('@') === -1 && text.indexOf('#') === -1)) return rawText;
+
+  const users = mentionUserData().lookup;
+  const channelIds = mentionChannelData().lookup;
+  let out = '';
+  let i = 0;
+
+  while (i < text.length) {
+    const ch = text[i];
+    if ((ch === '@' || ch === '#') && (i === 0 || /\s/.test(text[i - 1]))) {
+      const lookup = ch === '@' ? users : channelIds;
+      const name = longestMentionMatch(text, i + 1, lookup);
+      if (name) {
+        out += ch === '@' ? `<@${lookup.get(name)}>` : `<#${lookup.get(name)}>`;
+        i += 1 + name.length;
+        continue;
+      }
+    }
+    out += ch;
+    i++;
+  }
+
+  return out;
+}
+
 async function preloadUsers() {
   try {
     const { getUserClient } = await import('./user_client.js');
@@ -2627,7 +3318,7 @@ async function preloadUsers() {
       );
 
       seedUserNames(result.members || []);
-      allWorkspaceUsers = allWorkspaceUsers.concat(users);
+      allWorkspaceUsers.push(...users);
       totalLoaded += users.length;
       
       // Update status if we are in user search mode
@@ -2637,10 +3328,6 @@ async function preloadUsers() {
       }
 
       cursor = result.response_metadata?.next_cursor;
-      
-      // 2s delay to avoid rate limits (Tier 2: 20 req/min)
-      if (cursor) await new Promise(r => setTimeout(r, 2000));
-      
     } while (cursor);
     
     isUsersFullyLoaded = true;
@@ -2843,10 +3530,12 @@ function applyTheme() {
   updateStyle(globalSearchBox, { ...primary, border: borderStyle });
   updateStyle(userSearchBox, { ...primary, border: borderStyle });
   updateStyle(joinBox, { ...primary, border: borderStyle });
+  updateStyle(reactionBox, { ...primary, border: borderStyle });
   
   // Update Lists
   if (suggestionsBox) suggestionsBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
   if (userSuggestionsBox) userSuggestionsBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
+  if (mentionBox) mentionBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
   if (searchResultsBox) searchResultsBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle, scrollbar: scrollbarStyle };
   if (activityBox) activityBox.style = { ...primary, item: itemStyle, selected: selectedStyle, border: borderStyle };
   
