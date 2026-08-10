@@ -21,6 +21,8 @@ export const config = {
   clientSecret: process.env.SLACK_CLIENT_SECRET,
   oauthPort: Number(process.env.OAUTH_PORT || 3000),
   redirectUri: process.env.OAUTH_REDIRECT_URI,
+  xoxc: process.env.SLACK_XOXC,
+  xoxd: process.env.SLACK_XOXD,
   userScopes: process.env.OAUTH_USER_SCOPES || "channels:read,channels:write,channels:history,chat:write,users:read,groups:read,groups:write,groups:history,mpim:read,mpim:write,mpim:history,im:read,im:write,im:history,files:read,files:write,reactions:read,reactions:write,search:read,emoji:read"
 };
 

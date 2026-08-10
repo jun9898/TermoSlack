@@ -1,4 +1,5 @@
-import { createUI, setChannels, setReloadChannelsCallback } from './ui.js';
+import { createUI, setChannels, setSections, setReloadChannelsCallback } from './ui.js';
+import { fetchChannelSections } from './sections.js';
 import { createAuthServer, getAuthUrl } from './auth_server.js';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -57,7 +58,8 @@ async function main() {
       uiCreated = true;
     }
     await loadUserChannels();
-    
+    loadChannelSections();
+
     // Stop checking for auth once initialized
     if (authCheckInterval) {
       clearInterval(authCheckInterval);
@@ -161,6 +163,17 @@ async function main() {
       }
     }
   }, 2000); // Check every 2 seconds
+
+  async function loadChannelSections() {
+    try {
+      const sectionData = await fetchChannelSections();
+      if (!sectionData) return;
+      setSections(sectionData);
+      logInfo(`Applied ${sectionData.length} sidebar section(s) to the channel list`);
+    } catch (e) {
+      logError('Failed to apply sidebar sections', e);
+    }
+  }
 
   // Load user's channels
   async function loadUserChannels() {

@@ -10,6 +10,8 @@ import { getTheme, cycleTheme } from './themes.js';
 let screen, channelList, chatBox, input, header, statusBar, navbar, channelsBtn, dmsBtn, searchBox, joinBox, imageViewer, suggestionsBox;
 let globalSearchBox, searchResultsBox, threadBox, userSearchBox, userSuggestionsBox;
 let channels = [];
+let sections = null;
+let displayRows = [];
 let currentChannelId = null;
 let currentView = 'channels'; // 'channels' or 'dms'
 let searchMode = false;
@@ -1038,6 +1040,15 @@ export function createUI() {
     await selectChannel(index);
   });
 
+  channelList.on('keypress', (ch, key) => {
+    if (!key) return;
+    if (key.name === 'up' || key.name === 'k') {
+      if (moveOffSectionHeader(-1)) screen.render();
+    } else if (key.name === 'down' || key.name === 'j') {
+      if (moveOffSectionHeader(1)) screen.render();
+    }
+  });
+
   screen.key(['v'], async () => {
     if (messages.length > 0) {
       // Find messages with images and show the most recent one
@@ -1629,25 +1640,7 @@ export function createUI() {
 }
 
 async function selectChannel(index) {
-  const filteredChannels = channels.filter(ch => {
-    if (currentView === 'channels') {
-      if (ch.type !== 'channel') return false;
-      // Apply search filter
-      if (searchQuery) {
-        return ch.name.toLowerCase().includes(searchQuery);
-      }
-      return true;
-    } else {
-      if (ch.type !== 'dm' && ch.type !== 'mpim') return false;
-      // Apply search filter
-      if (searchQuery) {
-        return ch.name.toLowerCase().includes(searchQuery);
-      }
-      return true;
-    }
-  });
-
-  const selectedChannel = filteredChannels[index];
+  const selectedChannel = displayRows[index];
   if (selectedChannel) {
     currentChannelId = selectedChannel.id;
     const displayName = selectedChannel.is_private 
@@ -1694,9 +1687,94 @@ function updateButtonStyles() {
   screen.render();
 }
 
+function formatChannelItem(ch) {
+  return (ch.is_private ? '🔒 ' : '# ') + ch.name;
+}
+
+function formatSectionHeader(name) {
+  const tags = getTheme().tags || {};
+  const open = tags.channel || '';
+  const close = open ? (tags.reset || '{/}') : '';
+  return `${open}{bold}─ ${escapeText(name)} ─{/bold}${close}`;
+}
+
+function buildChannelRows(filteredChannels) {
+  const items = [];
+  const rows = [];
+
+  const pushFlat = () => {
+    for (const ch of filteredChannels) {
+      items.push(formatChannelItem(ch));
+      rows.push(ch);
+    }
+    return { items, rows };
+  };
+
+  if (!Array.isArray(sections) || sections.length === 0) return pushFlat();
+
+  const byId = new Map();
+  for (const ch of filteredChannels) byId.set(ch.id, ch);
+
+  const used = new Set();
+  const groups = [];
+  for (const section of sections) {
+    const members = [];
+    for (const id of section.channelIds) {
+      if (used.has(id)) continue;
+      const ch = byId.get(id);
+      if (!ch) continue;
+      members.push(ch);
+      used.add(id);
+    }
+    if (members.length > 0) groups.push({ name: section.name, members });
+  }
+
+  if (groups.length === 0) return pushFlat();
+
+  const ungrouped = filteredChannels.filter(ch => !used.has(ch.id));
+  if (ungrouped.length > 0) groups.push({ name: 'Channels', members: ungrouped });
+
+  for (const group of groups) {
+    items.push(formatSectionHeader(group.name));
+    rows.push(null);
+    for (const ch of group.members) {
+      items.push('  ' + formatChannelItem(ch));
+      rows.push(ch);
+    }
+  }
+
+  return { items, rows };
+}
+
+function moveOffSectionHeader(direction) {
+  if (!channelList || displayRows.length === 0) return false;
+  const current = channelList.selected || 0;
+  if (displayRows[current]) return false;
+
+  for (let i = current + direction; i >= 0 && i < displayRows.length; i += direction) {
+    if (displayRows[i]) {
+      channelList.select(i);
+      return true;
+    }
+  }
+  for (let i = current - direction; i >= 0 && i < displayRows.length; i -= direction) {
+    if (displayRows[i]) {
+      channelList.select(i);
+      return true;
+    }
+  }
+  return false;
+}
+
+function selectChannelRow(channelId) {
+  if (!channelList || !channelId) return;
+  const index = displayRows.findIndex(row => row && row.id === channelId);
+  if (index >= 0) channelList.select(index);
+}
+
 function updateView() {
   let filteredChannels;
-  
+
   if (currentView === 'activity') {
     chatBox.hide();
     threadBox.hide();
@@ -1722,14 +1800,14 @@ function updateView() {
       );
     }
     
-    const channelItems = filteredChannels.map(ch => 
-      (ch.is_private ? '🔒 ' : '# ') + ch.name
-    );
+    const { items: channelItems, rows } = buildChannelRows(filteredChannels);
+    displayRows = rows;
     channelList.setItems(channelItems);
-    
-    const statusText = searchQuery 
-      ? ` Status: Search "${searchQuery}" - ${channelItems.length} channels`
-      : ` Status: Viewing Channels (${channelItems.length})`;
+    moveOffSectionHeader(1);
+
+    const statusText = searchQuery
+      ? ` Status: Search "${searchQuery}" - ${filteredChannels.length} channels`
+      : ` Status: Viewing Channels (${filteredChannels.length})`;
     statusBar.setContent(statusText);
   } else if (currentView === 'dms') {
     channelList.setLabel(' Direct Messages ');
@@ -1743,6 +1821,7 @@ function updateView() {
     }
     
     const dmItems = filteredChannels.map(ch => '💬 {bold}' + ch.name + '{/bold}');
+    displayRows = filteredChannels.slice();
     channelList.setItems(dmItems);
     
     const statusText = searchQuery 
@@ -1759,6 +1838,22 @@ function updateView() {
 export function setChannels(channelData) {
   channels = channelData;
   updateView(); // Apply current view filter
+}
+
+export function setSections(sectionData) {
+  sections = Array.isArray(sectionData) && sectionData.length > 0 ? sectionData : null;
+
+  if (!channelList || currentView !== 'channels') return;
+
+  const previouslyFocused = screen ? screen.focused : null;
+  updateView();
+  selectChannelRow(currentChannelId);
+  moveOffSectionHeader(1);
+
+  if (previouslyFocused && previouslyFocused !== channelList && typeof previouslyFocused.focus === 'function') {
+    previouslyFocused.focus();
+  }
+  if (screen) screen.render();
 }
 
 export function updateStatus(message) {
