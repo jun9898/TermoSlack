@@ -51,18 +51,29 @@ let fetchQueue = [];
 let fetchActive = 0;
 let readyBatch = 0;
 let viewerActive = false;
+let tmuxWrap = false;
+
+function isInsideTmux(env) {
+  return !!env.TMUX || env.TERM_PROGRAM === 'tmux' || /^(screen|tmux)([.-]|$)/.test(env.TERM || '');
+}
+
+function outerTerminalSupported(env) {
+  if (env.KITTY_WINDOW_ID) return true;
+  if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) return true;
+  if (env.TERM_PROGRAM === 'ghostty') return true;
+  return /kitty|ghostty/i.test(env.TERM || '');
+}
 
 export function detectKittyGraphics(env = process.env) {
   const override = env.TERMOSLACK_KITTY;
   if (override === '0' || override === 'false') return false;
   if (override === '1' || override === 'true') return true;
 
-  if (env.TERM_PROGRAM === 'tmux' || /^(screen|tmux)([.-]|$)/.test(env.TERM || '')) return false;
+  return outerTerminalSupported(env);
+}
 
-  if (env.KITTY_WINDOW_ID) return true;
-  if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) return true;
-  if (env.TERM_PROGRAM === 'ghostty') return true;
-  return /kitty|ghostty/i.test(env.TERM || '');
+export function needsTmuxPassthrough(env = process.env) {
+  return isInsideTmux(env);
 }
 
 export function initKittyGraphics(screen, getToken) {
@@ -80,8 +91,9 @@ export function initKittyGraphics(screen, getToken) {
     }
     program = screen.program;
     tokenProvider = getToken;
+    tmuxWrap = needsTmuxPassthrough();
     enabled = true;
-    logInfo(`Kitty inline emoji enabled (TERM=${process.env.TERM})`);
+    logInfo(`Kitty inline emoji enabled (TERM=${process.env.TERM}${tmuxWrap ? ', tmux passthrough' : ''})`);
     return true;
   } catch (error) {
     logError('Kitty graphics init failed', error);
@@ -226,7 +238,11 @@ function allocateImageId() {
 
 function write(sequence) {
   try {
-    program._write(sequence);
+    if (tmuxWrap) {
+      program._write(`\x1bPtmux;${sequence.replaceAll('\x1b', '\x1b\x1b')}\x1b\\`);
+    } else {
+      program._write(sequence);
+    }
     return true;
   } catch (error) {
     logError('Kitty graphics write failed', error);
