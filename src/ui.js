@@ -46,6 +46,8 @@ let allWorkspaceUsers = [];
 let isUsersFullyLoaded = false;
 let customEmojis = {};
 
+const MAX_LOADED_MESSAGES = 300;
+
 export function createUI() {
   screen = blessed.screen({
     smartCSR: false,
@@ -1776,6 +1778,7 @@ async function selectChannel(index) {
       const loadedMessages = await loadMessages(currentChannelId, 50);
       if (seq !== channelLoadSeq) return;
       messages = loadedMessages;
+      selectedMessageIndex = loadedMessages.length - 1;
       displayMessages(loadedMessages);
       logInfo(`Switched to channel ${selectedChannel.name} (${currentChannelId})`);
     } catch (error) {
@@ -1815,15 +1818,19 @@ async function refreshOpenChannel() {
     if (messages.some(m => m.pending)) return;
     if (!latest || newestTs(latest) === newestTs(messages)) return;
 
+    const known = new Set(messages.map(m => m.ts));
+    const appended = latest.filter(m => !known.has(m.ts));
+    if (appended.length === 0) return;
+
     const wasAtBottom = messages.length === 0 || selectedMessageIndex === messages.length - 1;
     const selectedTs = selectedMessageIndex >= 0 ? messages[selectedMessageIndex]?.ts : null;
 
-    messages = latest;
+    messages = messages.concat(appended);
     if (wasAtBottom) {
-      selectedMessageIndex = latest.length - 1;
+      selectedMessageIndex = messages.length - 1;
     } else {
-      const idx = latest.findIndex(m => m.ts === selectedTs);
-      selectedMessageIndex = idx >= 0 ? idx : latest.length - 1;
+      const idx = messages.findIndex(m => m.ts === selectedTs);
+      selectedMessageIndex = idx >= 0 ? idx : messages.length - 1;
     }
 
     displayMessages(messages);
@@ -2191,16 +2198,82 @@ function processText(text) {
   return text;
 }
 
-function formatReactions(msg, borderColor) {
-  if (!msg.reactions || msg.reactions.length === 0) return '';
-  const theme = getTheme();
+function formatReactions(msg, fmt, theme) {
+  const sig = (msg.reactions || []).map(r => `${r.name}:${r.count}`).join(',');
+  if (fmt.rxSig === sig) return fmt.rxBody;
+
+  fmt.rxSig = sig;
+  if (!sig) {
+    fmt.rxBody = '';
+    return fmt.rxBody;
+  }
+
   const parts = msg.reactions.map(r => {
     let glyph;
     try { glyph = emojify(`:${r.name}:`); } catch (e) { glyph = `:${r.name}:`; }
     if (glyph === `:${r.name}:`) glyph = customEmojis[r.name] ? `:${r.name}:` : glyph;
     return `${glyph} ${r.count}`;
   });
-  return `\n{${borderColor}-fg}│{/${borderColor}-fg}   ${theme.tags.time}${parts.join('   ')}${theme.tags.reset}`;
+  fmt.rxBody = `${theme.tags.time}${parts.join('   ')}${theme.tags.reset}`;
+  return fmt.rxBody;
+}
+
+function messageTextCache(msg, contentWidth, theme) {
+  let fmt = msg._fmt;
+  if (fmt && fmt.width === contentWidth && fmt.theme === theme) return fmt;
+
+  let escapedText = escapeText(processText(msg.text || ''));
+
+  if (msg.files && msg.files.length > 0) {
+    const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
+    escapedText = escapedText ? `${escapedText}\n\n${fileNames}` : fileNames;
+  }
+
+  fmt = {
+    width: contentWidth,
+    theme,
+    lines: wrapText(escapedText, contentWidth - 5),
+    rxSig: null,
+    rxBody: '',
+    stamp: null,
+    block: '',
+    lineCount: 0
+  };
+  msg._fmt = fmt;
+  return fmt;
+}
+
+function messageBlock(msg, isSelected, contentWidth, theme) {
+  const fmt = messageTextCache(msg, contentWidth, theme);
+  const rxBody = formatReactions(msg, fmt, theme);
+  const username = msg.user_name || msg.username || 'Unknown';
+  const stamp = `${msg.ts}|${isSelected ? 1 : 0}|${msg.pending ? 1 : 0}|${msg.failed ? 1 : 0}|${msg.has_images ? 1 : 0}|${msg.reply_count || 0}|${username}|${fmt.rxSig}`;
+  if (fmt.stamp === stamp) return fmt;
+
+  const borderColor = isSelected ? theme.message.selectedBorder : theme.message.border;
+  const bar = `{${borderColor}-fg}│{/${borderColor}-fg}`;
+  const boxTop = `{${borderColor}-fg}┌${'─'.repeat(contentWidth)}┐{/${borderColor}-fg}`;
+  const boxBottom = `{${borderColor}-fg}└${'─'.repeat(contentWidth)}┘{/${borderColor}-fg}`;
+
+  const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
+  const imageIndicator = msg.has_images ? ' 📷' : '';
+  const selectionMarker = isSelected ? `{${theme.message.selectionMarker}-fg}➤{/${theme.message.selectionMarker}-fg} ` : '  ';
+  const sendState = msg.failed ? ' {red-fg}✗ failed{/red-fg}' : (msg.pending ? ' ⏳' : '');
+  const headerLine = `${bar} ${selectionMarker}${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
+
+  const textLines = fmt.lines.map(line => `${bar}   ${line}`).join('\n');
+
+  let threadLine = '';
+  if (msg.reply_count && msg.reply_count > 0) {
+    threadLine = `\n${bar}\n${bar}   ${theme.tags.thread}💬 ${msg.reply_count} ${msg.reply_count === 1 ? 'reply' : 'replies'}${theme.tags.reset}`;
+  }
+
+  const reactionsLine = rxBody ? `\n${bar}   ${rxBody}` : '';
+
+  fmt.stamp = stamp;
+  fmt.block = `${boxTop}\n${headerLine}\n${bar}\n${textLines}${reactionsLine}${threadLine}\n${boxBottom}`;
+  fmt.lineCount = 5 + Math.max(fmt.lines.length - 1, 0) + (reactionsLine ? 1 : 0) + (threadLine ? 2 : 0);
+  return fmt;
 }
 
 function displayMessages(msgs) {
@@ -2211,14 +2284,10 @@ function displayMessages(msgs) {
   }
 
   // Store messages - keep original order (oldest first)
-  messages = [...msgs];
-  
+  if (messages !== msgs) messages = msgs;
+
   // Validate and initialize selected message
-  if (selectedMessageIndex === -1) {
-    // First time - select newest message (last in array)
-    selectedMessageIndex = messages.length - 1;
-  } else if (selectedMessageIndex >= messages.length) {
-    // Messages changed, adjust to newest
+  if (selectedMessageIndex === -1 || selectedMessageIndex >= messages.length) {
     selectedMessageIndex = messages.length - 1;
   }
   // If selectedMessageIndex is valid (0 to length-1), keep it
@@ -2226,73 +2295,34 @@ function displayMessages(msgs) {
   const boxWidth = chatBox.width - 4; // Account for borders and padding
   const contentWidth = Math.max(50, boxWidth - 5); // Minimum width 50, leave space for box characters
   const theme = getTheme();
-  
+
   if (!theme || !theme.message || !theme.tags) {
     // Fallback if theme is broken
     chatBox.setContent('Error: Theme definition is incomplete.');
     return;
   }
 
-  const messageBlocks = messages.map((msg, index) => {
-    const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
-    const username = msg.user_name || msg.username || 'Unknown';
-    const imageIndicator = msg.has_images ? ' 📷' : '';
-    
-    let text = msg.text || '';
-    text = processText(text);
-    let escapedText = escapeText(text);
+  const blocks = new Array(messages.length);
+  const lineCounts = new Array(messages.length);
 
-    if (msg.files && msg.files.length > 0) {
-      const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
-      if (escapedText) {
-        escapedText += '\n\n' + fileNames;
-      } else {
-        escapedText = fileNames;
-      }
-    }
-    
-    // Highlight selected message
-    const isSelected = index === selectedMessageIndex;
-    const selectionMarker = isSelected ? `{${theme.message.selectionMarker}-fg}➤{/${theme.message.selectionMarker}-fg} ` : '  ';
-    
-    // Create message box
-    const borderColor = isSelected ? theme.message.selectedBorder : theme.message.border;
-    const boxTop = `{${borderColor}-fg}┌${'─'.repeat(contentWidth)}┐{/${borderColor}-fg}`;
-    const boxBottom = `{${borderColor}-fg}└${'─'.repeat(contentWidth)}┘{/${borderColor}-fg}`;
-    
-    // Format header line
-    const sendState = msg.failed ? ' {red-fg}✗ failed{/red-fg}' : (msg.pending ? ' ⏳' : '');
-    const headerLine = `{${borderColor}-fg}│{/${borderColor}-fg} ${selectionMarker}${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
-    
-    // Wrap message text to fit in box
-    const wrappedLines = wrapText(escapedText, contentWidth - 5);
-    const textLines = wrappedLines.map(line => 
-      `{${borderColor}-fg}│{/${borderColor}-fg}   ${line}`
-    ).join('\n');
-    
-    // Thread indicator on separate line if present
-    let threadLine = '';
-    if (msg.reply_count && msg.reply_count > 0) {
-      threadLine = `\n{${borderColor}-fg}│{/${borderColor}-fg}\n{${borderColor}-fg}│{/${borderColor}-fg}   ${theme.tags.thread}💬 ${msg.reply_count} ${msg.reply_count === 1 ? 'reply' : 'replies'}${theme.tags.reset}`;
-    }
-    
-    const reactionsLine = formatReactions(msg, borderColor);
+  for (let index = 0; index < messages.length; index++) {
+    const fmt = messageBlock(messages[index], index === selectedMessageIndex, contentWidth, theme);
+    blocks[index] = fmt.block;
+    lineCounts[index] = fmt.lineCount;
+  }
 
-    return `${boxTop}\n${headerLine}\n{${borderColor}-fg}│{/${borderColor}-fg}\n${textLines}${reactionsLine}${threadLine}\n${boxBottom}`;
-  });
+  chatBox.setContent(blocks.join('\n'));
 
-  chatBox.setContent(messageBlocks.join('\n'));
-
-  if (selectedMessageIndex >= messages.length - 1 || !messageBlocks[selectedMessageIndex]) {
+  if (selectedMessageIndex >= messages.length - 1) {
     chatBox.setScrollPerc(100);
   } else if (selectedMessageIndex <= 0) {
     chatBox.setScrollPerc(0);
   } else {
     let selectedTop = 0;
     for (let i = 0; i < selectedMessageIndex; i++) {
-      selectedTop += messageBlocks[i].split('\n').length;
+      selectedTop += lineCounts[i];
     }
-    const selectedHeight = messageBlocks[selectedMessageIndex].split('\n').length;
+    const selectedHeight = lineCounts[selectedMessageIndex];
     const viewportHeight = Number(chatBox.height) - 2;
     const target = Number.isFinite(viewportHeight)
       ? selectedTop - Math.floor((viewportHeight - selectedHeight) / 2)
@@ -2469,38 +2499,41 @@ function displaySearchResults(results, query) {
 
 async function loadMoreMessages() {
   if (!currentChannelId) return;
-  
+
+  if (messages.length >= MAX_LOADED_MESSAGES) {
+    statusBar.setContent(` Status: History limit reached (${MAX_LOADED_MESSAGES} messages loaded)`);
+    screen.render();
+    return;
+  }
+
   try {
     statusBar.setContent(' Status: Loading more messages...');
     screen.render();
-    
+
     // Get oldest message timestamp
     const oldestMessage = messages[0];
     const oldestTs = oldestMessage ? oldestMessage.ts : undefined;
-    
+
     // Load messages from 3-4 days ago (limit 100)
     const olderMessages = await loadMessages(currentChannelId, 100, oldestTs);
-    
-    if (olderMessages && olderMessages.length > 0) {
-      // Prepend older messages
-      const newMessages = [...olderMessages, ...messages];
-      messages = newMessages;
-      
-      const formattedMessages = messages.map(msg => {
-        const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
-        const username = msg.user_name || msg.username || 'Unknown';
-        const imageIndicator = msg.has_images ? ' 📷' : '';
-        const escapedText = escapeText(msg.text || '');
-        return `[${timestamp}] {blue-fg}{bold}${escapeText(username)}{/bold}{/blue-fg}:${imageIndicator} ${escapedText}`;
-      }).join('\n\n');
-      
-      chatBox.setContent(formattedMessages);
-      statusBar.setContent(` Status: Loaded ${olderMessages.length} more messages`);
-      logInfo(`Loaded ${olderMessages.length} older messages`);
+
+    const known = new Set(messages.map(m => m.ts));
+    const prepended = (olderMessages || []).filter(m => !known.has(m.ts));
+
+    if (prepended.length > 0) {
+      const selectedTs = selectedMessageIndex >= 0 ? messages[selectedMessageIndex]?.ts : null;
+      messages = prepended.concat(messages);
+
+      const idx = selectedTs ? messages.findIndex(m => m.ts === selectedTs) : -1;
+      selectedMessageIndex = idx >= 0 ? idx : prepended.length;
+
+      displayMessages(messages);
+      statusBar.setContent(` Status: Loaded ${prepended.length} more messages`);
+      logInfo(`Loaded ${prepended.length} older messages`);
     } else {
       statusBar.setContent(' Status: No more messages to load');
     }
-    
+
     screen.render();
   } catch (error) {
     statusBar.setContent(` Status: Error loading messages - ${error.message}`);

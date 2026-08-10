@@ -12,6 +12,42 @@ if (!fs.existsSync(APP_DIR)) {
 }
 
 const LOG_FILE = path.join(APP_DIR, 'termoslack.log');
+const MAX_LOG_SIZE = 5 * 1024 * 1024;
+
+let logStream = null;
+let logDisabled = false;
+
+function rotateIfOversized() {
+    try {
+        const stats = fs.statSync(LOG_FILE);
+        if (stats.size > MAX_LOG_SIZE) {
+            fs.renameSync(LOG_FILE, `${LOG_FILE}.old`);
+        }
+    } catch (err) {
+        if (err.code !== 'ENOENT') {
+            console.error('Failed to rotate log file:', err);
+        }
+    }
+}
+
+function openLogStream() {
+    try {
+        const stream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+        stream.on('error', (err) => {
+            logDisabled = true;
+            logStream = null;
+            console.error('Failed to write to log file:', err);
+        });
+        return stream;
+    } catch (err) {
+        logDisabled = true;
+        console.error('Failed to open log file:', err);
+        return null;
+    }
+}
+
+rotateIfOversized();
+logStream = openLogStream();
 
 function formatTimestamp() {
     return new Date().toISOString();
@@ -28,11 +64,23 @@ function writeLog(level, message, error = null) {
     }
     logMessage += '\n';
 
+    if (logDisabled || !logStream) return;
+
     try {
-        fs.appendFileSync(LOG_FILE, logMessage);
+        logStream.write(logMessage);
     } catch (err) {
+        logDisabled = true;
         console.error('Failed to write to log file:', err);
     }
+}
+
+function flushAndExit(code) {
+    if (!logStream) {
+        process.exit(code);
+        return;
+    }
+    setTimeout(() => process.exit(code), 1000);
+    logStream.end(() => process.exit(code));
 }
 
 export function logInfo(message) {
@@ -54,7 +102,7 @@ export function logFatal(message, error = null) {
 process.on('uncaughtException', (error) => {
   logFatal('Uncaught exception', error);
   console.error('Fatal error:', error);
-  process.exit(1);
+  flushAndExit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {

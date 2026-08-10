@@ -230,6 +230,76 @@ function replaceMentions(text) {
   return messageText;
 }
 
+function collectSearchMatchIds(matches) {
+  const userIds = new Set();
+  const channelIds = new Set();
+
+  for (const match of matches) {
+    if (match.user) userIds.add(match.user);
+    if (match.channel?.id) channelIds.add(match.channel.id);
+
+    const messageText = match.text || '';
+
+    if (messageText.includes('<@')) {
+      const mentions = messageText.match(USER_MENTION_PATTERN);
+      if (mentions) {
+        for (const mention of mentions) {
+          userIds.add(mention.match(/<@([A-Z0-9]+)/)[1]);
+        }
+      }
+    }
+
+    if (messageText.includes('<#')) {
+      const mentions = messageText.match(CHANNEL_MENTION_PATTERN);
+      if (mentions) {
+        for (const mention of mentions) {
+          if (mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/)) continue;
+          channelIds.add(mention.match(/<#([C][A-Z0-9]+)/)[1]);
+        }
+      }
+    }
+  }
+
+  return { userIds, channelIds };
+}
+
+function replaceSearchMentions(text) {
+  let messageText = text;
+
+  if (messageText.includes('<@')) {
+    const userMentions = messageText.match(USER_MENTION_PATTERN);
+    if (userMentions) {
+      for (const mention of userMentions) {
+        const userId = mention.match(/<@([A-Z0-9]+)/)[1];
+        const displayName = userNameCache.get(userId);
+        if (displayName) {
+          messageText = messageText.replace(mention, `@${displayName}`);
+        }
+      }
+    }
+  }
+
+  if (messageText.includes('<#')) {
+    const channelMentions = messageText.match(CHANNEL_MENTION_PATTERN);
+    if (channelMentions) {
+      for (const mention of channelMentions) {
+        const pipeMatch = mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/);
+        if (pipeMatch) {
+          messageText = messageText.replace(mention, `#${pipeMatch[1]}`);
+          continue;
+        }
+        const channelId = mention.match(/<#([C][A-Z0-9]+)/)[1];
+        const channelName = channelNameCache.get(channelId);
+        if (channelName) {
+          messageText = messageText.replace(mention, `#${channelName}`);
+        }
+      }
+    }
+  }
+
+  return messageText;
+}
+
 function decorateMessage(msg) {
   const userName = msg.user
     ? (userNameCache.get(msg.user) || msg.user)
@@ -354,94 +424,39 @@ export async function searchMessages(query, options = {}) {
     const result = await userClient.search.messages(searchOptions);
 
     // Process search results with user names and channel info
-    const processedMatches = await Promise.all(
-      result.messages.matches.map(async (match) => {
-        let userName = 'Unknown';
-        let channelName = 'Unknown';
+    const matches = result.messages.matches;
+    const { userIds, channelIds } = collectSearchMatchIds(matches);
 
-        // Get user name
-        if (match.user) {
-          try {
-            const userInfo = await userClient.users.info({ user: match.user });
-            userName = userInfo.user.profile?.display_name || userInfo.user.real_name || userInfo.user.name;
-          } catch (error) {
-            userName = match.username || match.user;
-          }
-        }
+    await Promise.all([
+      prefetchUserNames(userIds),
+      prefetchChannelNames(channelIds)
+    ]);
 
-        // Get channel name
-        if (match.channel?.id) {
-          try {
-            const channelInfo = await userClient.conversations.info({ channel: match.channel.id });
-            channelName = channelInfo.channel.name || match.channel.name;
-          } catch (error) {
-            channelName = match.channel.name || match.channel.id;
-          }
-        }
+    const processedMatches = matches.map((match) => {
+      const userName = match.user
+        ? (userNameCache.get(match.user) || match.username || match.user)
+        : 'Unknown';
 
-        // Replace user mentions in text
-        let messageText = match.text || '';
-        const mentionRegex = /<@[A-Z0-9]+(\|[^>]+)?>/g;
-        const mentions = messageText.match(mentionRegex);
-        
-        if (mentions) {
-          for (const mention of mentions) {
-            const userId = mention.match(/<@([A-Z0-9]+)/)[1];
-            try {
-              const userInfo = await userClient.users.info({ user: userId });
-              const displayName = userInfo.user.profile?.display_name || userInfo.user.real_name || userInfo.user.name;
-              messageText = messageText.replace(mention, `@${displayName}`);
-            } catch (err) {
-              // Keep original mention if user lookup fails
-            }
-          }
-        }
+      const channelName = match.channel?.id
+        ? (channelNameCache.get(match.channel.id) || match.channel.name || match.channel.id)
+        : 'Unknown';
 
-        // Replace channel mentions in text
-        const channelMentionRegex = /<#[C][A-Z0-9]+(\|[^>]+)?>/g;
-        const channelMentions = messageText.match(channelMentionRegex);
-        
-        if (channelMentions) {
-          for (const mention of channelMentions) {
-            // Check if channel name is already in the mention (format: <#C123|channel-name>)
-            const pipeMatch = mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/);
-            if (pipeMatch) {
-              // Use the name from the pipe format
-              const channelName = pipeMatch[1];
-              messageText = messageText.replace(mention, `#${channelName}`);
-            } else {
-              // Fetch channel name from API
-              const channelId = mention.match(/<#([C][A-Z0-9]+)/)[1];
-              try {
-                const channelInfo = await userClient.conversations.info({ channel: channelId });
-                const chName = channelInfo.channel.name;
-                messageText = messageText.replace(mention, `#${chName}`);
-              } catch (err) {
-                // Keep original mention if channel lookup fails
-                logError(`Failed to resolve channel ${channelId} in search`, err);
-              }
-            }
-          }
-        }
+      const hasImages = match.files && match.files.length > 0 &&
+                       match.files.some(f => f.mimetype?.startsWith('image/'));
 
-        // Check if message has files/images
-        const hasImages = match.files && match.files.length > 0 && 
-                         match.files.some(f => f.mimetype?.startsWith('image/'));
-        
-        const imageFiles = hasImages ? match.files.filter(f => f.mimetype?.startsWith('image/')) : [];
+      const imageFiles = hasImages ? match.files.filter(f => f.mimetype?.startsWith('image/')) : [];
 
-        return {
-          ...match,
-          text: messageText,
-          user_name: userName,
-          channel_name: channelName,
-          channel_id: match.channel?.id,
-          has_images: hasImages,
-          image_files: imageFiles,
-          permalink: match.permalink
-        };
-      })
-    );
+      return {
+        ...match,
+        text: replaceSearchMentions(match.text || ''),
+        user_name: userName,
+        channel_name: channelName,
+        channel_id: match.channel?.id,
+        has_images: hasImages,
+        image_files: imageFiles,
+        permalink: match.permalink
+      };
+    });
 
     logInfo(`Found ${processedMatches.length} results for "${query}"`);
 
@@ -548,53 +563,30 @@ export async function loadDMUserNames(channels, onProgress) {
             return channels;
         }
 
-        // Batch fetch user info with controlled concurrency  
-        const userMap = new Map();
         const userIdArray = Array.from(userIds);
-        const batchSize = 10; // Process 10 users at a time
-        let processed = 0;
-        
-        for (let i = 0; i < userIdArray.length; i += batchSize) {
-            const batch = userIdArray.slice(i, i + batchSize);
-            
-            // Fetch batch in parallel
-            const results = await Promise.allSettled(
-                batch.map(async (userId) => {
-                    const userInfo = await userClient.users.info({ user: userId });
-                    if (userInfo.ok && userInfo.user) {
-                        return {
-                            userId,
-                            name: userInfo.user.real_name || userInfo.user.name || userId
-                        };
-                    }
-                    return { userId, name: userId };
-                })
-            );
-            
-            // Store successful results
-            results.forEach(result => {
-                if (result.status === 'fulfilled' && result.value) {
-                    userMap.set(result.value.userId, result.value.name);
-                }
-            });
-            
+        const missing = userIdArray.filter(userId => !userNameCache.has(userId));
+        let processed = userIdArray.length - missing.length;
+
+        if (onProgress) {
+            onProgress(processed, userIdArray.length);
+        }
+
+        for (let i = 0; i < missing.length; i += INFO_FETCH_CONCURRENCY) {
+            const batch = missing.slice(i, i + INFO_FETCH_CONCURRENCY);
+            await prefetchUserNames(batch);
+
             processed += batch.length;
-            
+
             // Report progress
             if (onProgress) {
                 onProgress(processed, userIdArray.length);
-            }
-            
-            // Small delay between batches to respect rate limits
-            if (i + batchSize < userIdArray.length) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
             }
         }
 
         // Update channels with user names
         const updatedChannels = channels.map(channel => {
             if (channel.is_im && channel.user) {
-                const userName = userMap.get(channel.user) || channel.user || channel.id;
+                const userName = userNameCache.get(channel.user) || channel.user || channel.id;
                 return {
                     ...channel,
                     displayName: userName,
