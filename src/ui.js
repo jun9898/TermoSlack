@@ -4,7 +4,8 @@ import { fetchSavedItems, hasSavedCredentials } from './saved.js';
 import { exec } from 'child_process';
 import open from 'open';
 import { logInfo, logError } from './logger.js';
-import { getCachedImage, getSwatchColor } from './image_cache.js';
+import { getCachedImage, getSwatchColor, getImageBuffer } from './image_cache.js';
+import { initKittyGraphics, isKittyGraphicsEnabled, kittyEmojiToken, setKittyRepaintHandler, prepareKittyViewerImage, clearKittyViewerImage, kittyPlaceholderCell } from './kitty_graphics.js';
 import { deleteSession } from './storage.js';
 import { pickFile, clipboardImagePath } from './file_picker.js';
 import { emojify } from 'node-emoji';
@@ -130,6 +131,9 @@ export function createUI() {
     sendFocus: true,
     warnings: false
   });
+
+  initKittyGraphics(screen, getUserToken);
+  setKittyRepaintHandler(repaintForEmojiUpdate);
 
   // Load custom emojis in background
   loadCustomEmojis();
@@ -625,6 +629,7 @@ export function createUI() {
     content: ''
   });
   imageViewer.infoBox = imageInfoBox;
+  imageViewer.on('render', paintKittyViewer);
 
   screen.append(header);
   screen.append(railBox);
@@ -734,9 +739,15 @@ export function createUI() {
   applyRailLayout();
   updateRail();
   screen.on('resize', () => {
+    if (!imageViewer.hidden) {
+      closeImageViewer();
+      focusWidget(currentView === 'files' ? filesBox : chatBox);
+    }
     applyRailLayout();
     screen.render();
   });
+
+  process.on('exit', () => { try { clearKittyViewerImage(); } catch (e) {} });
 
   // Start with channel list focused
   channelList.focus();
@@ -1120,7 +1131,9 @@ export function createUI() {
     screen.render();
 
     try {
-      const art = await getCachedImage(found.url, getUserToken(), {
+      kittyViewer = null;
+      const inlineShown = await showKittyViewerImage(found.url, getUserToken());
+      const art = inlineShown ? '' : await getCachedImage(found.url, getUserToken(), {
         width: Math.min(screen.width, 60),
         height: Math.min(screen.height, 28)
       });
@@ -1130,13 +1143,13 @@ export function createUI() {
       imageViewer.setContent(art);
       imageViewer.currentImageUrl = found.url;
       imageViewer.show();
+      imageViewer.setFront();
       imageViewer.focus();
       statusBar.setContent(` Status: :${found.name}:`);
     } catch (error) {
       statusBar.setContent(` Status: Failed to load emoji - ${error.message}`);
       logError('Failed to preview custom emoji', error);
-      imageViewer.hide();
-      screen.realloc();
+      closeImageViewer();
     }
     screen.render();
   });
@@ -1392,7 +1405,7 @@ export function createUI() {
 
   screen.key(['escape'], () => {
     if (!imageViewer.hidden) {
-      imageViewer.hide();
+      closeImageViewer();
       focusWidget(currentView === 'files' ? filesBox : chatBox);
     } else if (threadMode) {
       closeThread();
@@ -2871,13 +2884,59 @@ function drainSwatchQueue() {
           drainSwatchQueue();
           return;
         }
-        if (swatchFetchActive === 0) {
-          for (const msg of messages) msg._fmt = null;
-          if (!chatBox.hidden && messages.length > 0) displayMessages(messages);
-          if (screen) screen.render();
-        }
+        if (swatchFetchActive === 0) repaintForEmojiUpdate();
       });
   }
+}
+
+let kittyViewer = null;
+
+async function showKittyViewerImage(url, token) {
+  if (!isKittyGraphicsEnabled()) return false;
+  const buffer = await getImageBuffer(url, token);
+  if (!buffer) return false;
+  const placement = prepareKittyViewerImage(buffer, Math.max(1, screen.width - 2), Math.max(1, screen.height - 2));
+  if (!placement) return false;
+  kittyViewer = placement;
+  return true;
+}
+
+function paintKittyViewer(coords) {
+  if (!kittyViewer || imageViewer.hidden) return;
+  const pos = coords || imageViewer.lpos;
+  if (!pos) return;
+
+  const { imageId, cols, rows } = kittyViewer;
+  const lines = screen.lines;
+  const top = pos.yi + Math.max(0, Math.floor((pos.yl - pos.yi - 1 - rows) / 2));
+  const left = pos.xi + Math.max(0, Math.floor((pos.xl - pos.xi - cols) / 2));
+  const attr = (screen.dattr & ~(0x1ff << 9)) | (imageId << 9);
+
+  for (let row = 0; row < rows; row++) {
+    const y = top + row;
+    if (y < 0 || y >= lines.length) continue;
+    for (let col = 0; col < cols; col++) {
+      const x = left + col;
+      if (x < 0 || x >= lines[y].length) continue;
+      lines[y][x][0] = attr;
+      lines[y][x][1] = kittyPlaceholderCell(row, col);
+    }
+    lines[y].dirty = true;
+  }
+}
+
+function closeImageViewer() {
+  kittyViewer = null;
+  clearKittyViewerImage();
+  imageViewer.hide();
+  imageViewer.setContent('');
+  screen.realloc();
+}
+
+function repaintForEmojiUpdate() {
+  for (const msg of messages) msg._fmt = null;
+  if (chatBox && !chatBox.hidden && messages.length > 0) displayMessages(messages);
+  if (screen) screen.render();
 }
 
 function resolveCustomEmoji(name) {
@@ -2905,6 +2964,11 @@ function processText(text) {
     const resolved = resolveCustomEmoji(name);
     if (!resolved) return match;
     if (resolved.glyph) return resolved.glyph;
+
+    if (isKittyGraphicsEnabled()) {
+      const inline = kittyEmojiToken(name, resolved.url);
+      if (inline) return inline;
+    }
 
     const swatch = emojiSwatches.get(name);
     if (swatch === undefined) requestEmojiSwatch(name, resolved.url);
@@ -3303,7 +3367,9 @@ async function showImage(message) {
     const availableWidth = Math.min(screen.width, 120);
     const availableHeight = Math.min(screen.height, 40);
 
-    const imageText = await getCachedImage(imageUrl, token, {
+    kittyViewer = null;
+    const inlineShown = await showKittyViewerImage(imageUrl, token);
+    const imageText = inlineShown ? '' : await getCachedImage(imageUrl, token, {
       width: availableWidth,
       height: availableHeight
     });
@@ -3327,11 +3393,10 @@ async function showImage(message) {
   } catch (error) {
     statusBar.setContent(` Status: Failed to load image - ${error.message} (O to open in browser)`);
     logError('Failed to show image', error);
-    imageViewer.hide();
+    closeImageViewer();
     if (message.image_files[0]) {
       imageViewer.currentImageUrl = message.image_files[0].permalink || message.image_files[0].url_private;
     }
-    screen.realloc();
     screen.render();
   }
 }

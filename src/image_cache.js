@@ -16,6 +16,12 @@ if (!fs.existsSync(CACHE_DIR)) {
     logInfo(`Created image cache directory `);
 }
 
+function writeCacheAtomic(cachePath, buffer) {
+    const tmpPath = `${cachePath}.${process.pid}.${Math.random().toString(36).slice(2)}`;
+    fs.writeFileSync(tmpPath, buffer);
+    fs.renameSync(tmpPath, cachePath);
+}
+
 export async function getCachedImage(url, token, options = {}) {
     try{
         const hash = crypto.createHash("md5").update(url).digest("hex");
@@ -39,7 +45,7 @@ export async function getCachedImage(url, token, options = {}) {
     }
     const buffer = await response.buffer();
 
-    fs.writeFileSync(cachePath, buffer);
+    writeCacheAtomic(cachePath, buffer);
     logInfo(`Cached image to: ${hash}`);
 
     return await terminalImage.buffer(buffer,{
@@ -50,6 +56,28 @@ export async function getCachedImage(url, token, options = {}) {
     } catch (error) {
         logError("Error in getCachedImage:", error);
         return '[❌ Image failed - Terminal quality limited. Press O to open in browser]'
+    }
+}
+
+export async function getImageBuffer(url, token) {
+    try {
+        const hash = crypto.createHash("md5").update(url).digest("hex");
+        const cachePath = path.join(CACHE_DIR, hash);
+
+        if (fs.existsSync(cachePath)) return fs.readFileSync(cachePath);
+
+        const response = await fetch(url, {
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+        });
+        if (!response.ok) throw new Error(`Failed to fetch image: ${response.statusText}`);
+        const buffer = await response.buffer();
+
+        writeCacheAtomic(cachePath, buffer);
+        logInfo(`Cached image to: ${hash}`);
+        return buffer;
+    } catch (error) {
+        logError("Error in getImageBuffer:", error);
+        return null;
     }
 }
 
