@@ -1,6 +1,5 @@
 import express from 'express';
 import { WebClient } from '@slack/web-api';
-import ngrok from '@ngrok/ngrok';
 import open from 'open';
 import { config } from './config.js';
 import { logInfo, logError } from './logger.js';
@@ -23,20 +22,12 @@ const userScopes = [
         "im:write",
         "im:history",
         "files:read",
-        "files:write",
-        "reactions:read",
-        "reactions:write",
-        "search:read",
-        "emoji:read",
-        "usergroups:read"
+        "search:read"
 ].join(',');
 
 export function createAuthServer(onSuccess) {
-  const PORT = 3000;
-  
-  // Get static domain from env or use default
-  const ngrokDomain = process.env.NGROK_DOMAIN || 'termoslack.ngrok.app';
-  const publicUrl = `https://${ngrokDomain}`;
+  const PORT = config.oauthPort || 3000;
+  const publicUrl = `http://localhost:${PORT}`;
 
   app.get('/auth/slack', (req, res) => {
     const authUrl = `https://slack.com/oauth/v2/authorize?client_id=${config.clientId}&user_scope=${userScopes}&redirect_uri=${publicUrl}/auth/callback`;
@@ -123,38 +114,13 @@ export function createAuthServer(onSuccess) {
 
   authServer = app.listen(PORT, () => {
     logInfo(`Local server running on port ${PORT}`);
-    
-    // Connect to ngrok in a separate async function
-    (async () => {
-      try {
-        // Connect to ngrok with static domain
-        await ngrok.connect({
-          addr: PORT,
-          authtoken: process.env.NGROK_AUTHTOKEN,
-          domain: ngrokDomain,
-        });
-
-        logInfo(`ngrok tunnel established at ${publicUrl}`);
-        console.log(`\n🔗 To authenticate, open: ${publicUrl}/auth/slack\n`);
-        
-        // Auto-open browser
-        await open(`${publicUrl}/auth/slack`);
-        
-      } catch (error) {
-        logError('Failed to start ngrok tunnel', error);
-        console.error('\n❌ Failed to create ngrok tunnel. Make sure:');
-        console.error('1. You have an ngrok account');
-        console.error('2. NGROK_AUTHTOKEN is set in .env');
-        console.error('3. Your static domain is configured correctly\n');
-        console.error(`Error details: ${error.message}\n`);
-      }
-    })();
+    console.log(`\n🔗 To authenticate, open: ${publicUrl}/auth/slack\n`);
+    open(`${publicUrl}/auth/slack`).catch(() => {});
   });
 
   return authServer;
 }
 
 export function getAuthUrl() {
-  const ngrokDomain = process.env.NGROK_DOMAIN || 'termoslack.ngrok.app';
-  return `https://${ngrokDomain}/auth/slack`;
+  return `http://localhost:${config.oauthPort || 3000}/auth/slack`;
 }
