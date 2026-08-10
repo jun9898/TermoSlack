@@ -3055,7 +3055,7 @@ function messageTextCache(msg, contentWidth, theme) {
   let fmt = msg._fmt;
   if (fmt && fmt.width === contentWidth && fmt.theme === theme) return fmt;
 
-  let escapedText = applyBold(escapeText(processText(msg.text || '')));
+  let escapedText = applyBold(processText(escapeText(msg.text || '')));
 
   if (msg.files && msg.files.length > 0) {
     const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
