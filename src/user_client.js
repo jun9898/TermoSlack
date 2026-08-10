@@ -62,6 +62,154 @@ export async function sendMessage(channelId, text, threadTs = null) {
 }
 
 
+const userNameCache = new Map();
+const channelNameCache = new Map();
+const INFO_FETCH_CONCURRENCY = 8;
+
+const USER_MENTION_PATTERN = /<@[A-Z0-9]+(\|[^>]+)?>/g;
+const CHANNEL_MENTION_PATTERN = /<#[C][A-Z0-9]+(\|[^>]+)?>/g;
+
+function resolveUserName(user) {
+  return user?.profile?.display_name || user?.real_name || user?.name;
+}
+
+function collectMentionedUserIds(messages) {
+  const userIds = new Set();
+
+  for (const msg of messages) {
+    if (msg.user) {
+      userIds.add(msg.user);
+    }
+
+    const messageText = msg.text || '';
+    if (!messageText.includes('<@')) continue;
+
+    const mentions = messageText.match(USER_MENTION_PATTERN);
+    if (!mentions) continue;
+
+    for (const mention of mentions) {
+      userIds.add(mention.match(/<@([A-Z0-9]+)/)[1]);
+    }
+  }
+
+  return userIds;
+}
+
+function collectMentionedChannelIds(messages) {
+  const channelIds = new Set();
+
+  for (const msg of messages) {
+    const messageText = msg.text || '';
+    if (!messageText.includes('<#')) continue;
+
+    const mentions = messageText.match(CHANNEL_MENTION_PATTERN);
+    if (!mentions) continue;
+
+    for (const mention of mentions) {
+      if (mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/)) continue;
+      channelIds.add(mention.match(/<#([C][A-Z0-9]+)/)[1]);
+    }
+  }
+
+  return channelIds;
+}
+
+async function fetchInBatches(ids, fetchOne) {
+  for (let i = 0; i < ids.length; i += INFO_FETCH_CONCURRENCY) {
+    const batch = ids.slice(i, i + INFO_FETCH_CONCURRENCY);
+    await Promise.allSettled(batch.map(fetchOne));
+  }
+}
+
+async function prefetchUserNames(userIds) {
+  const pending = Array.from(userIds).filter(userId => !userNameCache.has(userId));
+  if (pending.length === 0) return;
+
+  await fetchInBatches(pending, async (userId) => {
+    const userInfo = await userClient.users.info({ user: userId });
+    const name = resolveUserName(userInfo.user);
+    if (name) {
+      userNameCache.set(userId, name);
+    }
+  });
+}
+
+async function prefetchChannelNames(channelIds) {
+  const pending = Array.from(channelIds).filter(channelId => !channelNameCache.has(channelId));
+  if (pending.length === 0) return;
+
+  await fetchInBatches(pending, async (channelId) => {
+    try {
+      const channelInfo = await userClient.conversations.info({ channel: channelId });
+      if (channelInfo.channel?.name) {
+        channelNameCache.set(channelId, channelInfo.channel.name);
+      }
+    } catch (error) {
+      logError(`Failed to resolve channel ${channelId}`, error);
+      throw error;
+    }
+  });
+}
+
+function replaceMentions(text) {
+  let messageText = text;
+
+  if (messageText.includes('<@')) {
+    const userMentions = messageText.match(USER_MENTION_PATTERN);
+    if (userMentions) {
+      for (const mention of userMentions) {
+        const userId = mention.match(/<@([A-Z0-9]+)/)[1];
+        messageText = messageText.replace(mention, `@${userNameCache.get(userId) || userId}`);
+      }
+    }
+  }
+
+  if (messageText.includes('<#')) {
+    const channelMentions = messageText.match(CHANNEL_MENTION_PATTERN);
+    if (channelMentions) {
+      for (const mention of channelMentions) {
+        const pipeMatch = mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/);
+        if (pipeMatch) {
+          messageText = messageText.replace(mention, `#${pipeMatch[1]}`);
+        } else {
+          const channelId = mention.match(/<#([C][A-Z0-9]+)/)[1];
+          messageText = messageText.replace(mention, `#${channelNameCache.get(channelId) || channelId}`);
+        }
+      }
+    }
+  }
+
+  return messageText;
+}
+
+function decorateMessage(msg) {
+  const userName = msg.user
+    ? (userNameCache.get(msg.user) || msg.user)
+    : (msg.username || 'Unknown');
+
+  const hasImages = msg.files && msg.files.length > 0 &&
+                   msg.files.some(f => f.mimetype?.startsWith('image/'));
+
+  const imageFiles = hasImages ? msg.files.filter(f => f.mimetype?.startsWith('image/')) : [];
+
+  return {
+    ...msg,
+    text: replaceMentions(msg.text || ''),
+    user_name: userName,
+    has_images: hasImages,
+    image_files: imageFiles
+  };
+}
+
+async function decorateMessages(messages) {
+  await Promise.all([
+    prefetchUserNames(collectMentionedUserIds(messages)),
+    prefetchChannelNames(collectMentionedChannelIds(messages))
+  ]);
+
+  return messages.map(decorateMessage);
+}
+
 export async function loadMessages(channelId, limit = 20, oldest = undefined) {
   try {
     if (!userClient) {
@@ -80,86 +228,7 @@ export async function loadMessages(channelId, limit = 20, oldest = undefined) {
 
     const result = await userClient.conversations.history(params);
 
-    // Get user names for messages and detect images
-    const messagesWithNames = await Promise.all(
-      result.messages.map(async (msg) => {
-        let userName = 'Unknown';
-        
-        if (msg.user) {
-          try {
-            const userInfo = await userClient.users.info({ user: msg.user });
-            userName = userInfo.user.profile?.display_name || userInfo.user.real_name || userInfo.user.name;
-          } catch (error) {
-            userName = msg.user;
-          }
-        } else {
-          userName = msg.username || 'Unknown';
-        }
-
-        // Replace user mentions in message text with usernames
-        let messageText = msg.text || '';
-        
-        // Replace user mentions
-        if (messageText.includes('<@')) {
-          const userMentions = messageText.match(/<@[A-Z0-9]+(\|[^>]+)?>/g);
-          if (userMentions) {
-            for (const mention of userMentions) {
-              const userId = mention.match(/<@([A-Z0-9]+)/)[1];
-              try {
-                const mentionedUserInfo = await userClient.users.info({ user: userId });
-                const mentionedName = mentionedUserInfo.user.profile?.display_name || 
-                                     mentionedUserInfo.user.real_name || 
-                                     mentionedUserInfo.user.name;
-                messageText = messageText.replace(mention, `@${mentionedName}`);
-              } catch (error) {
-                // Keep original if user info fetch fails
-                messageText = messageText.replace(mention, `@${userId}`);
-              }
-            }
-          }
-        }
-
-        if (messageText.includes('<#')) {
-          const channelMentions = messageText.match(/<#[C][A-Z0-9]+(\|[^>]+)?>/g);
-          if (channelMentions) {
-            for (const mention of channelMentions) {
-              // Check if channel name is already in the mention (format: <#C123|channel-name>)
-              const pipeMatch = mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/);
-              if (pipeMatch) {
-                // Use the name from the pipe format
-                const channelName = pipeMatch[1];
-                messageText = messageText.replace(mention, `#${channelName}`);
-              } else {
-                // Fetch channel name from API
-                const channelId = mention.match(/<#([C][A-Z0-9]+)/)[1];
-                try {
-                  const channelInfo = await userClient.conversations.info({ channel: channelId });
-                  const channelName = channelInfo.channel.name;
-                  messageText = messageText.replace(mention, `#${channelName}`);
-                } catch (error) {
-                  // Keep original if channel info fetch fails
-                  logError(`Failed to resolve channel ${channelId}`, error);
-                  messageText = messageText.replace(mention, `#${channelId}`);
-                }
-              }
-            }
-          }
-        }
-
-        const hasImages = msg.files && msg.files.length > 0 && 
-                         msg.files.some(f => f.mimetype?.startsWith('image/'));
-        
-        const imageFiles = hasImages ? msg.files.filter(f => f.mimetype?.startsWith('image/')) : [];
-
-        return {
-          ...msg,
-          text: messageText,
-          user_name: userName,
-          has_images: hasImages,
-          image_files: imageFiles
-        };
-      })
-    );
+    const messagesWithNames = await decorateMessages(result.messages);
 
     logInfo(`Loaded ${messagesWithNames.length} messages from channel ${channelId}`);
     return messagesWithNames.reverse();
@@ -181,82 +250,7 @@ export async function loadThreadReplies(channelId, threadTs) {
       limit: 100
     });
 
-    // Process replies with user names
-    const repliesWithNames = await Promise.all(
-      result.messages.map(async (msg) => {
-        let userName = 'Unknown';
-        
-        if (msg.user) {
-          try {
-            const userInfo = await userClient.users.info({ user: msg.user });
-            userName = userInfo.user.profile?.display_name || userInfo.user.real_name || userInfo.user.name;
-          } catch (error) {
-            userName = msg.user;
-          }
-        } else {
-          userName = msg.username || 'Unknown';
-        }
-
-        // Replace mentions in text
-        let messageText = msg.text || '';
-        
-        // Replace user mentions
-        if (messageText.includes('<@')) {
-          const userMentions = messageText.match(/<@[A-Z0-9]+(\|[^>]+)?>/g);
-          if (userMentions) {
-            for (const mention of userMentions) {
-              const userId = mention.match(/<@([A-Z0-9]+)/)[1];
-              try {
-                const mentionedUserInfo = await userClient.users.info({ user: userId });
-                const mentionedName = mentionedUserInfo.user.profile?.display_name || 
-                                     mentionedUserInfo.user.real_name || 
-                                     mentionedUserInfo.user.name;
-                messageText = messageText.replace(mention, `@${mentionedName}`);
-              } catch (error) {
-                messageText = messageText.replace(mention, `@${userId}`);
-              }
-            }
-          }
-        }
-
-        // Replace channel mentions
-        if (messageText.includes('<#')) {
-          const channelMentions = messageText.match(/<#[C][A-Z0-9]+(\|[^>]+)?>/g);
-          if (channelMentions) {
-            for (const mention of channelMentions) {
-              const pipeMatch = mention.match(/<#[C][A-Z0-9]+\|([^>]+)>/);
-              if (pipeMatch) {
-                const channelName = pipeMatch[1];
-                messageText = messageText.replace(mention, `#${channelName}`);
-              } else {
-                const channelId = mention.match(/<#([C][A-Z0-9]+)/)[1];
-                try {
-                  const channelInfo = await userClient.conversations.info({ channel: channelId });
-                  const channelName = channelInfo.channel.name;
-                  messageText = messageText.replace(mention, `#${channelName}`);
-                } catch (error) {
-                  logError(`Failed to resolve channel ${channelId}`, error);
-                  messageText = messageText.replace(mention, `#${channelId}`);
-                }
-              }
-            }
-          }
-        }
-
-        const hasImages = msg.files && msg.files.length > 0 && 
-                         msg.files.some(f => f.mimetype?.startsWith('image/'));
-        
-        const imageFiles = hasImages ? msg.files.filter(f => f.mimetype?.startsWith('image/')) : [];
-
-        return {
-          ...msg,
-          text: messageText,
-          user_name: userName,
-          has_images: hasImages,
-          image_files: imageFiles
-        };
-      })
-    );
+    const repliesWithNames = await decorateMessages(result.messages);
 
     logInfo(`Loaded ${repliesWithNames.length} thread replies`);
     return repliesWithNames;
