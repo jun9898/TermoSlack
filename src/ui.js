@@ -151,8 +151,8 @@ export function createUI() {
     height: '100%-6',
     label: ' Views ',
     tags: true,
-    keys: false,
-    vi: false,
+    keys: true,
+    vi: true,
     mouse: false,
     interactive: true,
     items: RAIL_ENTRIES.map(entry => ` ${entry.label}`),
@@ -1427,7 +1427,17 @@ export function createUI() {
     if (chatBox.focused) {
       channelList.focus();
       screen.render();
+      return;
     }
+    if (channelList.focused && !railBox.hidden) {
+      focusWidget(railBox);
+      screen.render();
+    }
+  });
+
+  railBox.key(['l', 'enter'], async () => {
+    const entry = RAIL_ENTRIES[railBox.selected];
+    if (entry) await activateRailView(entry.view);
   });
 
   // Channel selection (keyboard)
@@ -2171,6 +2181,17 @@ export function createUI() {
     focusWidget(threadMode ? threadBox : chatBox);
   });
 
+  railBox.on('focus', () => {
+    updateBorders();
+    screen.render();
+  });
+
+  railBox.on('blur', () => {
+    updateRail();
+    updateBorders();
+    screen.render();
+  });
+
   chatBox.on('focus', () => {
     updateBorders();
     screen.render();
@@ -2325,6 +2346,29 @@ function toggleOverlayView(view) {
   return opening;
 }
 
+async function activateRailView(view) {
+  if (view === 'channels' || view === 'dms') {
+    currentView = view;
+    updateView();
+    updateButtonStyles();
+    focusWidget(channelList);
+    screen.render();
+    return;
+  }
+
+  if (currentView !== view) {
+    toggleOverlayView(view);
+    if (view === 'activity') await loadActivity();
+    else if (view === 'files') await loadFiles();
+    else if (view === 'saved') await loadSaved();
+    return;
+  }
+
+  const target = view === 'activity' ? activityBox : view === 'files' ? filesBox : savedBox;
+  focusWidget(target);
+  screen.render();
+}
+
 async function jumpToMessage({ channelId, ts, threadTs, label }) {
   if (!channelId) return;
 
@@ -2372,7 +2416,7 @@ function updateBorders() {
   const theme = getTheme();
   const accent = theme.focusBorder || 'yellow';
   const base = theme.border || {};
-  const panels = [channelList, chatBox, threadBox, activityBox, filesBox, savedBox, input];
+  const panels = [railBox, channelList, chatBox, threadBox, activityBox, filesBox, savedBox, input];
 
   for (const panel of panels) {
     if (!panel || !panel.style) continue;
