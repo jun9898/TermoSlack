@@ -2837,7 +2837,8 @@ function messageBlock(msg, isSelected, contentWidth, theme) {
   const fmt = messageTextCache(msg, contentWidth, theme);
   const rxBody = formatReactions(msg, fmt, theme);
   const username = msg.user_name || msg.username || 'Unknown';
-  const stamp = `${msg.ts}|${isSelected ? 1 : 0}|${msg.pending ? 1 : 0}|${msg.failed ? 1 : 0}|${msg.has_images ? 1 : 0}|${msg.reply_count || 0}|${username}|${fmt.rxSig}`;
+  const own = isOwnMessage(msg);
+  const stamp = `${msg.ts}|${isSelected ? 1 : 0}|${msg.pending ? 1 : 0}|${msg.failed ? 1 : 0}|${msg.has_images ? 1 : 0}|${msg.reply_count || 0}|${username}|${own ? 1 : 0}|${fmt.rxSig}`;
   if (fmt.stamp === stamp) return fmt;
 
   const borderColor = isSelected ? theme.message.selectedBorder : theme.message.border;
@@ -2849,7 +2850,8 @@ function messageBlock(msg, isSelected, contentWidth, theme) {
   const imageIndicator = msg.has_images ? ' 📷' : '';
   const selectionMarker = isSelected ? `{${theme.message.selectionMarker}-fg}➤{/${theme.message.selectionMarker}-fg} ` : '  ';
   const sendState = msg.failed ? ' {red-fg}✗ failed{/red-fg}' : (msg.pending ? ' ⏳' : '');
-  const headerLine = `${bar} ${selectionMarker}${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
+  const userTag = own ? `{${theme.message.selfUser || 'green'}-fg}` : theme.tags.user;
+  const headerLine = `${bar} ${selectionMarker}${userTag}{bold}${escapeText(username)}${own ? ' (me)' : ''}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
 
   const textLines = fmt.lines.map(line => `${bar}   ${line}`).join('\n');
 

@@ -14,6 +14,7 @@ export const themes = {
       text: 'white',
       border: 'blue',
       selectedBorder: 'yellow',
+      selfUser: 'green',
       selectionMarker: 'yellow'
     },
     input: { fg: 'white', bg: 'black', border: 'white' },
@@ -42,6 +43,7 @@ export const themes = {
       text: 'green',
       border: 'green',
       selectedBorder: 'white',
+      selfUser: 'yellow',
       selectionMarker: 'white'
     },
     input: { fg: 'green', bg: 'black', border: 'green' },
@@ -70,6 +72,7 @@ export const themes = {
       text: 'black',
       border: 'black',
       selectedBorder: 'blue',
+      selfUser: 'magenta',
       selectionMarker: 'blue'
     },
     input: { fg: 'black', bg: 'white', border: 'black' },
@@ -98,6 +101,7 @@ export const themes = {
       text: 'white',
       border: 'cyan',
       selectedBorder: 'white',
+      selfUser: 'yellow',
       selectionMarker: 'white'
     },
     input: { fg: 'white', bg: 'blue', border: 'cyan' },
