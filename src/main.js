@@ -170,9 +170,9 @@ async function main() {
 
   async function loadUnreadCounts() {
     try {
-      const counts = await fetchUnreadCounts();
-      if (!counts) return;
-      setUnreads(counts);
+      const result = await fetchUnreadCounts();
+      if (!result) return;
+      setUnreads(result.counts, result.threads);
     } catch (e) {
       logError('Failed to apply unread counts', e);
     }

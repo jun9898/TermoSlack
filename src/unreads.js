@@ -92,7 +92,14 @@ export async function fetchUnreadCounts() {
       return null;
     }
 
-    return counts;
+    const threads = result.payload.threads || {};
+    return {
+      counts,
+      threads: {
+        hasUnreads: !!threads.has_unreads,
+        mentionCount: Number(threads.mention_count) || 0
+      }
+    };
   } catch (err) {
     logError('Failed to fetch Slack unread counts', err);
     return null;

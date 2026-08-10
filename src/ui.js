@@ -54,6 +54,7 @@ let displayRows = [];
 let unreads = new Map();
 let hasUnreadData = false;
 let locallyRead = new Set();
+let threadActivity = { hasUnreads: false, mentionCount: 0 };
 let messagePollTimer = null;
 let pollingInFlight = false;
 let channelLoadSeq = 0;
@@ -2331,8 +2332,34 @@ function applyRailLayout() {
   }
 }
 
+function railBadge(view) {
+  if (!hasUnreadData) return '';
+
+  if (view === 'dms') {
+    let dmCount = 0;
+    for (const id of unreads.keys()) {
+      if (id.startsWith('D')) dmCount++;
+    }
+    return dmCount > 0 ? ` ●${dmCount}` : '';
+  }
+
+  if (view === 'activity') {
+    let mentions = threadActivity.mentionCount;
+    for (const value of unreads.values()) mentions += value.mentionCount;
+    if (mentions > 0) return ` ●${mentions}`;
+    return threadActivity.hasUnreads ? ' ●' : '';
+  }
+
+  return '';
+}
+
 function updateRail() {
   if (!railBox) return;
+  const accent = getTheme().focusBorder || 'yellow';
+  railBox.setItems(RAIL_ENTRIES.map(entry => {
+    const badge = railBadge(entry.view);
+    return ` ${entry.label}${badge ? `{${accent}-fg}{bold}${badge}{/bold}{/${accent}-fg}` : ''}`;
+  }));
   const index = RAIL_ENTRIES.findIndex(entry => entry.view === currentView);
   railBox.select(index >= 0 ? index : 0);
 }
@@ -2679,16 +2706,22 @@ function unreadsEqual(a, b) {
   return true;
 }
 
-export function setUnreads(counts) {
+export function setUnreads(counts, threads) {
   if (!(counts instanceof Map)) return;
 
   for (const id of locallyRead) counts.delete(id);
   locallyRead.clear();
 
+  threadActivity = threads || threadActivity;
+
   const unchanged = hasUnreadData && unreadsEqual(counts, unreads);
   unreads = counts;
   hasUnreadData = true;
-  if (unchanged) return;
+  updateRail();
+  if (unchanged) {
+    if (screen) screen.render();
+    return;
+  }
 
   logInfo(`Unread state changed: ${unreads.size} conversation(s) unread`);
   refreshChannelList();
