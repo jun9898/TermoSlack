@@ -17,6 +17,7 @@ let hasUnreadData = false;
 let locallyRead = new Set();
 let messagePollTimer = null;
 let pollingInFlight = false;
+let channelLoadSeq = 0;
 let currentChannelId = null;
 let currentView = 'channels'; // 'channels' or 'dms'
 let searchMode = false;
@@ -1668,28 +1669,31 @@ async function selectChannel(index) {
   const selectedChannel = displayRows[index];
   if (selectedChannel) {
     currentChannelId = selectedChannel.id;
+    const seq = ++channelLoadSeq;
     markChannelRead(selectedChannel.id);
     const displayName = selectedChannel.is_private
-      ? `🔒 ${selectedChannel.name}` 
-      : selectedChannel.type === 'channel' 
-        ? `# ${selectedChannel.name}` 
+      ? `🔒 ${selectedChannel.name}`
+      : selectedChannel.type === 'channel'
+        ? `# ${selectedChannel.name}`
         : `💬 ${selectedChannel.name}`;
-    
+
     chatBox.setLabel(` Messages - ${displayName} `);
-    
+
     // Reset selection when switching channels
     selectedMessageIndex = -1;
-    
+
     try {
-      const loadedMessages = await loadMessages(currentChannelId);
+      const loadedMessages = await loadMessages(currentChannelId, 50);
+      if (seq !== channelLoadSeq) return;
       messages = loadedMessages;
       displayMessages(loadedMessages);
       logInfo(`Switched to channel ${selectedChannel.name} (${currentChannelId})`);
     } catch (error) {
+      if (seq !== channelLoadSeq) return;
       chatBox.setContent(`Error loading messages: ${error.message}`);
       logError('Failed to load messages for channel', error);
     }
-    
+
     screen.render();
   }
 }
@@ -1707,10 +1711,15 @@ async function refreshOpenChannel() {
   if (!currentChannelId || threadMode || pollingInFlight) return;
   if (currentView !== 'channels' && currentView !== 'dms') return;
   if (input && input.focused) return;
+  if (chatBox.hidden) return;
 
   pollingInFlight = true;
+  const polledChannelId = currentChannelId;
+  const seq = channelLoadSeq;
   try {
-    const latest = await loadMessages(currentChannelId, 50);
+    const latest = await loadMessages(polledChannelId, 50);
+    if (polledChannelId !== currentChannelId || seq !== channelLoadSeq) return;
+    if (threadMode || chatBox.hidden) return;
     if (!latest || newestTs(latest) === newestTs(messages)) return;
 
     const wasAtBottom = messages.length === 0 || selectedMessageIndex === messages.length - 1;
@@ -2180,19 +2189,20 @@ function displayMessages(msgs) {
 
   chatBox.setContent(messageBlocks.join('\n'));
 
-  let selectedTop = 0;
-  for (let i = 0; i < selectedMessageIndex; i++) {
-    selectedTop += messageBlocks[i].split('\n').length;
-  }
-  const selectedHeight = messageBlocks[selectedMessageIndex].split('\n').length;
-  const viewportHeight = chatBox.height - 2;
-
-  if (selectedMessageIndex === messages.length - 1) {
+  if (selectedMessageIndex >= messages.length - 1 || !messageBlocks[selectedMessageIndex]) {
     chatBox.setScrollPerc(100);
-  } else if (selectedMessageIndex === 0) {
+  } else if (selectedMessageIndex <= 0) {
     chatBox.setScrollPerc(0);
   } else {
-    const target = selectedTop - Math.floor((viewportHeight - selectedHeight) / 2);
+    let selectedTop = 0;
+    for (let i = 0; i < selectedMessageIndex; i++) {
+      selectedTop += messageBlocks[i].split('\n').length;
+    }
+    const selectedHeight = messageBlocks[selectedMessageIndex].split('\n').length;
+    const viewportHeight = Number(chatBox.height) - 2;
+    const target = Number.isFinite(viewportHeight)
+      ? selectedTop - Math.floor((viewportHeight - selectedHeight) / 2)
+      : selectedTop;
     chatBox.scrollTo(Math.max(0, target));
   }
 

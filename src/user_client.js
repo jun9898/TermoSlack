@@ -73,6 +73,54 @@ function resolveUserName(user) {
   return user?.profile?.display_name || user?.real_name || user?.name;
 }
 
+function decodeEntities(text) {
+  return text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
+
+export function extractDisplayText(msg) {
+  let base = msg.text || '';
+
+  if (Array.isArray(msg.blocks)) {
+    const parts = [];
+    for (const block of msg.blocks) {
+      if (block.type === 'header' && block.text?.text) parts.push(block.text.text);
+      if (block.type === 'section') {
+        if (block.text?.text) parts.push(block.text.text);
+        if (Array.isArray(block.fields)) {
+          for (const field of block.fields) {
+            if (field?.text) parts.push(field.text);
+          }
+        }
+      }
+      if (block.type === 'context' && Array.isArray(block.elements)) {
+        for (const el of block.elements) {
+          if (el?.text) parts.push(el.text);
+        }
+      }
+    }
+    const joined = parts.join('\n');
+    if (joined.trim().length > base.trim().length) base = joined;
+  }
+
+  if (!base.trim() && Array.isArray(msg.attachments)) {
+    const parts = [];
+    for (const att of msg.attachments) {
+      if (att.title) parts.push(att.title);
+      if (att.text) parts.push(att.text);
+      if (!att.title && !att.text && att.fallback) parts.push(att.fallback);
+    }
+    base = parts.join('\n');
+  }
+
+  return decodeEntities(base);
+}
+
+function formatLinks(text) {
+  return text
+    .replace(/<(https?:\/\/[^>|]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:\/\/[^>|]+)>/g, '$1');
+}
+
 function collectMentionedUserIds(messages) {
   const userIds = new Set();
 
@@ -81,7 +129,7 @@ function collectMentionedUserIds(messages) {
       userIds.add(msg.user);
     }
 
-    const messageText = msg.text || '';
+    const messageText = extractDisplayText(msg);
     if (!messageText.includes('<@')) continue;
 
     const mentions = messageText.match(USER_MENTION_PATTERN);
@@ -99,7 +147,7 @@ function collectMentionedChannelIds(messages) {
   const channelIds = new Set();
 
   for (const msg of messages) {
-    const messageText = msg.text || '';
+    const messageText = extractDisplayText(msg);
     if (!messageText.includes('<#')) continue;
 
     const mentions = messageText.match(CHANNEL_MENTION_PATTERN);
@@ -185,7 +233,7 @@ function replaceMentions(text) {
 function decorateMessage(msg) {
   const userName = msg.user
     ? (userNameCache.get(msg.user) || msg.user)
-    : (msg.username || 'Unknown');
+    : (msg.username || msg.bot_profile?.name || 'Unknown');
 
   const hasImages = msg.files && msg.files.length > 0 &&
                    msg.files.some(f => f.mimetype?.startsWith('image/'));
@@ -194,7 +242,7 @@ function decorateMessage(msg) {
 
   return {
     ...msg,
-    text: replaceMentions(msg.text || ''),
+    text: formatLinks(replaceMentions(extractDisplayText(msg))),
     user_name: userName,
     has_images: hasImages,
     image_files: imageFiles
