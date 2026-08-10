@@ -64,10 +64,14 @@ export async function sendMessage(channelId, text, threadTs = null) {
 
 const userNameCache = new Map();
 const channelNameCache = new Map();
+const botNameCache = new Map();
 const INFO_FETCH_CONCURRENCY = 8;
 
 const USER_MENTION_PATTERN = /<@[A-Z0-9]+(\|[^>]+)?>/g;
 const CHANNEL_MENTION_PATTERN = /<#[C][A-Z0-9]+(\|[^>]+)?>/g;
+const DATE_MENTION_PATTERN = /<!date\^[^>|]*(?:\|([^>]*))?>/g;
+const SUBTEAM_MENTION_PATTERN = /<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>/g;
+const BROADCAST_MENTION_PATTERN = /<!(channel|here|everyone)(?:\|[^>]*)?>/g;
 
 function resolveUserName(user) {
   return user?.profile?.display_name || user?.real_name || user?.name;
@@ -199,6 +203,15 @@ async function prefetchChannelNames(channelIds) {
   });
 }
 
+function replaceSpecialMentions(text) {
+  if (!text.includes('<!')) return text;
+
+  return text
+    .replace(DATE_MENTION_PATTERN, (match, fallback) => (fallback ? fallback : match))
+    .replace(SUBTEAM_MENTION_PATTERN, (match, label) => (label ? `@${label.replace(/^@/, '')}` : '@group'))
+    .replace(BROADCAST_MENTION_PATTERN, (match, keyword) => `@${keyword}`);
+}
+
 function replaceMentions(text) {
   let messageText = text;
 
@@ -227,7 +240,7 @@ function replaceMentions(text) {
     }
   }
 
-  return messageText;
+  return replaceSpecialMentions(messageText);
 }
 
 function collectSearchMatchIds(matches) {
@@ -297,13 +310,39 @@ function replaceSearchMentions(text) {
     }
   }
 
-  return messageText;
+  return replaceSpecialMentions(messageText);
+}
+
+function collectUnresolvedBotIds(messages) {
+  const botIds = new Set();
+
+  for (const msg of messages) {
+    if (msg.user || msg.username || msg.bot_profile?.name) continue;
+    if (msg.bot_id) botIds.add(msg.bot_id);
+  }
+
+  return botIds;
+}
+
+async function prefetchBotNames(botIds) {
+  const pending = Array.from(botIds).filter(botId => !botNameCache.has(botId));
+  if (pending.length === 0) return;
+
+  await fetchInBatches(pending, async (botId) => {
+    try {
+      const botInfo = await userClient.bots.info({ bot: botId });
+      botNameCache.set(botId, botInfo.bot?.name || 'Bot');
+    } catch (error) {
+      logError(`Failed to resolve bot ${botId}`, error);
+      botNameCache.set(botId, 'Bot');
+    }
+  });
 }
 
 function decorateMessage(msg) {
   const userName = msg.user
     ? (userNameCache.get(msg.user) || msg.user)
-    : (msg.username || msg.bot_profile?.name || 'Unknown');
+    : (msg.username || msg.bot_profile?.name || (msg.bot_id ? botNameCache.get(msg.bot_id) : null) || 'Bot');
 
   const hasImages = msg.files && msg.files.length > 0 &&
                    msg.files.some(f => f.mimetype?.startsWith('image/'));
@@ -322,7 +361,8 @@ function decorateMessage(msg) {
 async function decorateMessages(messages) {
   await Promise.all([
     prefetchUserNames(collectMentionedUserIds(messages)),
-    prefetchChannelNames(collectMentionedChannelIds(messages))
+    prefetchChannelNames(collectMentionedChannelIds(messages)),
+    prefetchBotNames(collectUnresolvedBotIds(messages))
   ]);
 
   return messages.map(decorateMessage);
