@@ -15,6 +15,8 @@ let displayRows = [];
 let unreads = new Map();
 let hasUnreadData = false;
 let locallyRead = new Set();
+let messagePollTimer = null;
+let pollingInFlight = false;
 let currentChannelId = null;
 let currentView = 'channels'; // 'channels' or 'dms'
 let searchMode = false;
@@ -713,12 +715,19 @@ export function createUI() {
     }
   });
 
-  // Tab - Switch focus between channel list and input
+  // Tab - Cycle focus: channels -> messages -> input -> channels
   screen.key(['tab'], () => {
+    if (threadMode) {
+      if (threadBox.focused) input.focus();
+      else threadBox.focus();
+      screen.render();
+      return;
+    }
     if (channelList.focused) {
-      input.focus();
-    } else if (input.focused) {
-      channelList.focus();
+      focusChatArea();
+    } else if (chatBox.focused) {
+      if (!input.hidden) input.focus();
+      else channelList.focus();
     } else {
       channelList.focus();
     }
@@ -1647,6 +1656,7 @@ export function createUI() {
   });
 
   updateBorders();
+  startMessagePolling();
 
   // Start caching users in background
   preloadUsers();
@@ -1687,6 +1697,45 @@ async function selectChannel(index) {
 function isTyping() {
   if (searchMode || globalSearchMode || userSearchMode || joinMode) return true;
   return !!(input && input.focused);
+}
+
+function newestTs(list) {
+  return list && list.length > 0 ? list[list.length - 1].ts : null;
+}
+
+async function refreshOpenChannel() {
+  if (!currentChannelId || threadMode || pollingInFlight) return;
+  if (currentView !== 'channels' && currentView !== 'dms') return;
+  if (input && input.focused) return;
+
+  pollingInFlight = true;
+  try {
+    const latest = await loadMessages(currentChannelId, 50);
+    if (!latest || newestTs(latest) === newestTs(messages)) return;
+
+    const wasAtBottom = messages.length === 0 || selectedMessageIndex === messages.length - 1;
+    const selectedTs = selectedMessageIndex >= 0 ? messages[selectedMessageIndex]?.ts : null;
+
+    messages = latest;
+    if (wasAtBottom) {
+      selectedMessageIndex = latest.length - 1;
+    } else {
+      const idx = latest.findIndex(m => m.ts === selectedTs);
+      selectedMessageIndex = idx >= 0 ? idx : latest.length - 1;
+    }
+
+    displayMessages(messages);
+    if (unreads.has(currentChannelId)) markChannelRead(currentChannelId);
+  } catch (e) {
+    logError('Failed to refresh open channel', e);
+  } finally {
+    pollingInFlight = false;
+  }
+}
+
+function startMessagePolling() {
+  if (messagePollTimer) return;
+  messagePollTimer = setInterval(refreshOpenChannel, 5000);
 }
 
 function updateBorders() {
