@@ -121,7 +121,7 @@ export function extractDisplayText(msg) {
 
 function formatLinks(text) {
   return text
-    .replace(/<(https?:\/\/[^>|]+)\|([^>]+)>/g, '$2')
+    .replace(/<(https?:\/\/[^>|]+)\|([^>]+)>/g, (match, url, label) => (label.includes('…') ? url : label))
     .replace(/<(https?:\/\/[^>|]+)>/g, '$1');
 }
 
