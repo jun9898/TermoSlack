@@ -7,6 +7,7 @@ export const themes = {
     selected: { fg: 'black', bg: 'white' },
     item: { fg: 'white', bg: 'black' },
     header: { fg: 'white', bg: 'black', bold: true },
+    focusBorder: 'yellow',
     message: {
       user: 'cyan',
       time: 'gray',
@@ -34,6 +35,7 @@ export const themes = {
     selected: { fg: 'black', bg: 'green' },
     item: { fg: 'green', bg: 'black' },
     header: { fg: 'green', bg: 'black', bold: true },
+    focusBorder: 'white',
     message: {
       user: 'green',
       time: 'green',
@@ -61,6 +63,7 @@ export const themes = {
     selected: { fg: 'white', bg: 'blue' },
     item: { fg: 'black', bg: 'white' },
     header: { fg: 'black', bg: 'white', bold: true },
+    focusBorder: 'blue',
     message: {
       user: 'blue',
       time: 'gray',
@@ -88,6 +91,7 @@ export const themes = {
     selected: { fg: 'blue', bg: 'white' },
     item: { fg: 'white', bg: 'blue' },
     header: { fg: 'white', bg: 'blue', bold: true },
+    focusBorder: 'yellow',
     message: {
       user: 'white',
       time: 'cyan',

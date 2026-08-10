@@ -1636,6 +1636,13 @@ export function createUI() {
     screen.render();
   });
 
+  threadBox.on('focus', () => {
+    updateBorders();
+    screen.render();
+  });
+
+  updateBorders();
+
   // Start caching users in background
   preloadUsers();
 
@@ -1673,8 +1680,19 @@ async function selectChannel(index) {
 }
 
 function updateBorders() {
-  // Just render the screen
-  screen.render();
+  const theme = getTheme();
+  const accent = theme.focusBorder || 'yellow';
+  const panels = [channelList, chatBox, threadBox, activityBox, input];
+
+  for (const panel of panels) {
+    if (!panel || !panel.style || !panel.style.border) continue;
+    const focused = screen && screen.focused === panel;
+    panel.style.border.fg = focused ? accent : theme.border.fg;
+    panel.style.border.bold = focused;
+    if (panel.style.label) panel.style.label.fg = focused ? accent : theme.border.fg;
+  }
+
+  if (screen) screen.render();
 }
 
 function updateButtonStyles() {
@@ -1701,27 +1719,32 @@ function mentionBadge(unread) {
   return unread && unread.mentionCount > 0 ? ` (${unread.mentionCount})` : '';
 }
 
+function unreadDot(unread) {
+  const accent = getTheme().focusBorder || 'yellow';
+  return unread ? `{${accent}-fg}●{/${accent}-fg} ` : '  ';
+}
+
 function formatChannelItem(ch) {
   const prefix = ch.is_private ? '🔒 ' : '# ';
-  if (!hasUnreadData) return prefix + ch.name;
+  if (!hasUnreadData) return '  ' + prefix + ch.name;
 
   const unread = unreads.get(ch.id);
   const label = ch.name + mentionBadge(unread);
-  if (unread) return `${prefix}{bold}${label}{/bold}`;
+  if (unread) return `${unreadDot(unread)}${prefix}{bold}${label}{/bold}`;
 
   const muted = mutedTag();
-  return `${prefix}${muted.open}${label}${muted.close}`;
+  return `${unreadDot(unread)}${prefix}${muted.open}${label}${muted.close}`;
 }
 
 function formatDMItem(ch) {
-  if (!hasUnreadData) return '💬 {bold}' + ch.name + '{/bold}';
+  if (!hasUnreadData) return '  💬 {bold}' + ch.name + '{/bold}';
 
   const unread = unreads.get(ch.id);
   const label = ch.name + mentionBadge(unread);
-  if (unread) return `💬 {bold}${label}{/bold}`;
+  if (unread) return `${unreadDot(unread)}💬 {bold}${label}{/bold}`;
 
   const muted = mutedTag();
-  return `💬 ${muted.open}${label}${muted.close}`;
+  return `${unreadDot(unread)}💬 ${muted.open}${label}${muted.close}`;
 }
 
 function formatSectionHeader(name) {
