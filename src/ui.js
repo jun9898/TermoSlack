@@ -4,7 +4,7 @@ import { fetchSavedItems, hasSavedCredentials } from './saved.js';
 import { exec } from 'child_process';
 import open from 'open';
 import { logInfo, logError } from './logger.js';
-import { getCachedImage } from './image_cache.js';
+import { getCachedImage, getSwatchColor } from './image_cache.js';
 import { deleteSession } from './storage.js';
 import { pickFile, clipboardImagePath } from './file_picker.js';
 import { emojify } from 'node-emoji';
@@ -2848,6 +2848,38 @@ async function loadCustomEmojis() {
 
 const CUSTOM_EMOJI_PATTERN = /:([\w가-힣ㄱ-ㅎㅏ-ㅣ+'-]+):/g;
 
+const emojiSwatches = new Map();
+let swatchFetchQueue = [];
+let swatchFetchActive = 0;
+
+function requestEmojiSwatch(name, url) {
+  if (emojiSwatches.has(name) || swatchFetchQueue.some(job => job.name === name)) return;
+  swatchFetchQueue.push({ name, url });
+  drainSwatchQueue();
+}
+
+function drainSwatchQueue() {
+  while (swatchFetchActive < 4 && swatchFetchQueue.length > 0) {
+    const job = swatchFetchQueue.shift();
+    swatchFetchActive++;
+    getSwatchColor(job.url, getUserToken())
+      .then(color => { emojiSwatches.set(job.name, color); })
+      .catch(() => { emojiSwatches.set(job.name, null); })
+      .finally(() => {
+        swatchFetchActive--;
+        if (swatchFetchQueue.length > 0) {
+          drainSwatchQueue();
+          return;
+        }
+        if (swatchFetchActive === 0) {
+          for (const msg of messages) msg._fmt = null;
+          if (!chatBox.hidden && messages.length > 0) displayMessages(messages);
+          if (screen) screen.render();
+        }
+      });
+  }
+}
+
 function resolveCustomEmoji(name) {
   let value = customEmojis[name];
   for (let hop = 0; hop < 3 && typeof value === 'string' && value.startsWith('alias:'); hop++) {
@@ -2873,7 +2905,11 @@ function processText(text) {
     const resolved = resolveCustomEmoji(name);
     if (!resolved) return match;
     if (resolved.glyph) return resolved.glyph;
-    return `${theme.tags.attachment}${match}${theme.tags.reset}`;
+
+    const swatch = emojiSwatches.get(name);
+    if (swatch === undefined) requestEmojiSwatch(name, resolved.url);
+    const block = swatch ? `{${swatch}-fg}◪{/} ` : '';
+    return `${block}${theme.tags.attachment}${match}${theme.tags.reset}`;
   });
 
   return text;

@@ -67,6 +67,19 @@ export async function clearImageCache() {
     }
 }
 
+export async function getSwatchColor(url, token) {
+    try {
+        const art = await getCachedImage(url, token, { width: 2, height: 1 });
+        const match = /38;2;(\d+);(\d+);(\d+)/.exec(art) || /48;2;(\d+);(\d+);(\d+)/.exec(art);
+        if (!match) return null;
+        const hex = (n) => Number(n).toString(16).padStart(2, '0');
+        return `#${hex(match[1])}${hex(match[2])}${hex(match[3])}`;
+    } catch (error) {
+        logError('Failed to compute swatch color', error);
+        return null;
+    }
+}
+
 export async function getImageThumbnail(url, token) {
     return await getCachedImage(url, token, {
         width: 20,
