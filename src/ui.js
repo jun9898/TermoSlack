@@ -2037,7 +2037,7 @@ function displayMessages(msgs) {
     return;
   }
 
-  const formattedMessages = messages.map((msg, index) => {
+  const messageBlocks = messages.map((msg, index) => {
     const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
     const username = msg.user_name || msg.username || 'Unknown';
     const imageIndicator = msg.has_images ? ' 📷' : '';
@@ -2080,23 +2080,26 @@ function displayMessages(msgs) {
     }
     
     return `${boxTop}\n${headerLine}\n{${borderColor}-fg}│{/${borderColor}-fg}\n${textLines}${threadLine}\n${boxBottom}`;
-  }).join('\n');
+  });
 
-  chatBox.setContent(formattedMessages);
-  
-  // Scroll to keep selected message visible
+  chatBox.setContent(messageBlocks.join('\n'));
+
+  let selectedTop = 0;
+  for (let i = 0; i < selectedMessageIndex; i++) {
+    selectedTop += messageBlocks[i].split('\n').length;
+  }
+  const selectedHeight = messageBlocks[selectedMessageIndex].split('\n').length;
+  const viewportHeight = chatBox.height - 2;
+
   if (selectedMessageIndex === messages.length - 1) {
-    // Most recent message - scroll to bottom
     chatBox.setScrollPerc(100);
   } else if (selectedMessageIndex === 0) {
-    // Oldest message - scroll to top
     chatBox.setScrollPerc(0);
   } else {
-    // Calculate scroll position to keep selected message in view
-    const scrollPercent = (selectedMessageIndex / (messages.length - 1)) * 100;
-    chatBox.setScrollPerc(scrollPercent);
+    const target = selectedTop - Math.floor((viewportHeight - selectedHeight) / 2);
+    chatBox.scrollTo(Math.max(0, target));
   }
-  
+
   screen.render();
 }
 
