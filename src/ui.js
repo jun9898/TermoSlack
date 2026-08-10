@@ -1,5 +1,5 @@
 import blessed from 'neo-blessed';
-import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis } from './user_client.js';
+import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName } from './user_client.js';
 import { logInfo, logError } from './logger.js';
 import { getCachedImage } from './image_cache.js';
 import { deleteSession } from './storage.js';
@@ -18,6 +18,7 @@ let locallyRead = new Set();
 let messagePollTimer = null;
 let pollingInFlight = false;
 let channelLoadSeq = 0;
+let selfDisplayName = null;
 let currentChannelId = null;
 let currentView = 'channels'; // 'channels' or 'dms'
 let searchMode = false;
@@ -1150,44 +1151,68 @@ export function createUI() {
       return;
     }
 
-    if (value.trim()) {
-      try {
-        // If in thread mode, send as thread reply
-        const threadTs = threadMode ? currentThreadTs : null;
-        await sendMessage(currentChannelId, value, threadTs);
-        statusBar.setContent(` Status: Message sent ${threadMode ? '(in thread) ' : ''}✓`);
-        statusBar.style.fg = 'green';
-        
-        // Reload messages or thread replies
-        if (threadMode) {
-          const replies = await loadThreadReplies(currentChannelId, currentThreadTs);
-          threadMessages = replies;
-          displayThread(replies);
-        } else {
-          // Small delay to ensure Slack API consistency
-          await new Promise(resolve => setTimeout(resolve, 300));
-
-          const msgs = await loadMessages(currentChannelId, 50);
-          messages = msgs;
-          
-          // Update selection to the new message (last one)
-          selectedMessageIndex = messages.length - 1;
-          
-          displayMessages(messages);
-          chatBox.setScrollPerc(100);
-        }
-        
-        logInfo(`Message sent to channel ${currentChannelId}${threadMode ? ' (in thread)' : ''}`);
-      } catch (error) {
-        statusBar.setContent(` Status: Error - ${error.message}`);
-        statusBar.style.fg = 'red';
-        logError(`Failed to send message to channel ${currentChannelId}`, error);
-      }
-    }
-
+    const text = value.trim();
     input.clearValue();
     input.focus();
+
+    if (!text) {
+      screen.render();
+      return;
+    }
+
+    const threadTs = threadMode ? currentThreadTs : null;
+    const sentInThread = threadMode;
+    const pending = {
+      ts: String(Date.now() / 1000),
+      user_name: selfDisplayName || 'Me',
+      text,
+      pending: true,
+      has_images: false,
+      image_files: []
+    };
+
+    if (sentInThread) {
+      threadMessages.push(pending);
+      displayThread(threadMessages);
+    } else {
+      messages.push(pending);
+      selectedMessageIndex = messages.length - 1;
+      displayMessages(messages);
+    }
     screen.render();
+
+    if (!selfDisplayName) {
+      getSelfName().then(name => {
+        selfDisplayName = name;
+        pending.user_name = name;
+      }).catch(() => {});
+    }
+
+    sendMessage(currentChannelId, text, threadTs)
+      .then(result => {
+        pending.ts = result.ts || pending.ts;
+        pending.pending = false;
+        if (sentInThread) {
+          if (threadMode && currentThreadTs === threadTs) displayThread(threadMessages);
+        } else {
+          displayMessages(messages);
+        }
+        screen.render();
+        logInfo(`Message sent to channel ${currentChannelId}${sentInThread ? ' (in thread)' : ''}`);
+      })
+      .catch(error => {
+        pending.pending = false;
+        pending.failed = true;
+        if (sentInThread) {
+          if (threadMode && currentThreadTs === threadTs) displayThread(threadMessages);
+        } else {
+          displayMessages(messages);
+        }
+        statusBar.setContent(` Status: Send failed - ${error.message}`);
+        statusBar.style.fg = 'red';
+        screen.render();
+        logError(`Failed to send message to channel ${currentChannelId}`, error);
+      });
   });
 
   // Search box handlers
@@ -1714,6 +1739,7 @@ export function createUI() {
 
   updateBorders();
   startMessagePolling();
+  getSelfName().then(name => { selfDisplayName = name; }).catch(() => {});
 
   // Start caching users in background
   preloadUsers();
@@ -1777,6 +1803,8 @@ async function refreshOpenChannel() {
   if (input && input.focused) return;
   if (chatBox.hidden) return;
 
+  if (messages.some(m => m.pending)) return;
+
   pollingInFlight = true;
   const polledChannelId = currentChannelId;
   const seq = channelLoadSeq;
@@ -1784,6 +1812,7 @@ async function refreshOpenChannel() {
     const latest = await loadMessages(polledChannelId, 50);
     if (polledChannelId !== currentChannelId || seq !== channelLoadSeq) return;
     if (threadMode || chatBox.hidden) return;
+    if (messages.some(m => m.pending)) return;
     if (!latest || newestTs(latest) === newestTs(messages)) return;
 
     const wasAtBottom = messages.length === 0 || selectedMessageIndex === messages.length - 1;
@@ -2232,7 +2261,8 @@ function displayMessages(msgs) {
     const boxBottom = `{${borderColor}-fg}└${'─'.repeat(contentWidth)}┘{/${borderColor}-fg}`;
     
     // Format header line
-    const headerLine = `{${borderColor}-fg}│{/${borderColor}-fg} ${selectionMarker}${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}`;
+    const sendState = msg.failed ? ' {red-fg}✗ failed{/red-fg}' : (msg.pending ? ' ⏳' : '');
+    const headerLine = `{${borderColor}-fg}│{/${borderColor}-fg} ${selectionMarker}${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
     
     // Wrap message text to fit in box
     const wrappedLines = wrapText(escapedText, contentWidth - 5);

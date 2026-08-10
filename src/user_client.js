@@ -621,6 +621,21 @@ export async function logoutUser() {
   }
 }
 
+let selfName = null;
+
+export async function getSelfName() {
+    if (selfName) return selfName;
+    try {
+        const auth = await userClient.auth.test();
+        await prefetchUserNames(new Set([auth.user_id]));
+        selfName = userNameCache.get(auth.user_id) || auth.user || 'Me';
+    } catch (error) {
+        logError('Failed to resolve own display name', error);
+        selfName = 'Me';
+    }
+    return selfName;
+}
+
 export async function uploadFile(channelId, filePath, title, threadTs = null) {
     if (!userClient) {
         throw new Error('User client not initialized');
