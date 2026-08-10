@@ -94,8 +94,8 @@ export function createUI() {
     label: ' Messages ',
     scrollable: true,
     alwaysScroll: true,
-    keys: true,
-    vi: true,
+    keys: false,
+    vi: false,
     tags: true,
     wrap: false, // We'll handle wrapping manually
     scrollbar: {
@@ -723,18 +723,12 @@ export function createUI() {
   // Enter - Focus chat area for message navigation
   screen.key(['enter'], () => {
     if (!input.focused && !chatBox.focused) {
-      chatBox.focus();
-      // Initialize selected message when focusing chat
-      if (messages.length > 0 && selectedMessageIndex === -1) {
-        selectedMessageIndex = messages.length - 1; // Select most recent (bottom)
-        displayMessages(messages);
-      }
-      screen.render();
+      focusChatArea();
     }
   });
 
   // Arrow keys for scrolling messages
-  screen.key(['up'], () => {
+  screen.key(['up', 'k'], () => {
     if (chatBox.focused && messages.length > 0) {
       // UP = go to older messages (decrease index, move up visually)
       if (selectedMessageIndex > 0) {
@@ -749,7 +743,7 @@ export function createUI() {
     }
   });
 
-  screen.key(['down'], () => {
+  screen.key(['down', 'j'], () => {
     if (chatBox.focused && messages.length > 0) {
       // DOWN = go to newer messages (increase index, move down visually)
       if (selectedMessageIndex < messages.length - 1) {
@@ -962,12 +956,7 @@ export function createUI() {
       imageViewer.hide();
       chatBox.focus();
     } else if (threadMode) {
-      threadMode = false;
-      currentThreadTs = null;
-      threadBox.hide();
-      chatBox.show();
-      input.show();
-      chatBox.focus();
+      closeThread();
     } else if (globalSearchMode) {
       globalSearchMode = false;
       globalSearchBox.hide();
@@ -1009,47 +998,38 @@ export function createUI() {
 
   // T key - View thread
   screen.key(['t'], async () => {
-    if (!chatBox.focused) {
-      statusBar.setContent(' Status: Focus chat area first (press Enter)');
-      screen.render();
-      return;
-    }
-    
-    if (!messages || messages.length === 0) {
-      statusBar.setContent(' Status: No messages loaded');
-      screen.render();
-      return;
-    }
-    
-    // Validate selectedMessageIndex
-    if (selectedMessageIndex < 0 || selectedMessageIndex >= messages.length) {
-      statusBar.setContent(' Status: No message selected. Use arrow keys to select a message');
-      screen.render();
-      return;
-    }
-    
-    const selectedMessage = messages[selectedMessageIndex];
-    
-    if (!selectedMessage || !selectedMessage.ts) {
-      statusBar.setContent(' Status: Invalid message selected');
-      screen.render();
-      return;
-    }
-    
-    // Show which message is being opened
-    const username = selectedMessage.user_name || selectedMessage.username || 'Unknown';
-    statusBar.setContent(` Status: Opening thread from ${username}...`);
+    await openSelectedThread();
+  });
+
+  // I key - Enter input mode
+  screen.key(['i'], () => {
+    if (searchMode || globalSearchMode || userSearchMode || joinMode) return;
+    if (input.hidden) return;
+    input.focus();
     screen.render();
-    
-    // Check if message has thread replies
-    if (selectedMessage.reply_count && selectedMessage.reply_count > 0) {
-      await viewThread(selectedMessage.ts);
-    } else if (selectedMessage.thread_ts) {
-      // Message is part of a thread
-      await viewThread(selectedMessage.thread_ts);
-    } else {
-      // Start a new thread with this message
-      await viewThread(selectedMessage.ts);
+  });
+
+  // L key - Enter (channel list -> chat, chat -> thread)
+  screen.key(['l'], async () => {
+    if (channelList.focused) {
+      focusChatArea();
+      return;
+    }
+    if (chatBox.focused) {
+      await openSelectedThread();
+    }
+  });
+
+  // H key - Leave (thread -> chat, chat -> channel list)
+  screen.key(['h'], () => {
+    if (threadMode) {
+      closeThread();
+      screen.render();
+      return;
+    }
+    if (chatBox.focused) {
+      channelList.focus();
+      screen.render();
     }
   });
 
@@ -1058,7 +1038,7 @@ export function createUI() {
     await selectChannel(index);
   });
 
-    screen.key(['i', 'v'], async () => {
+  screen.key(['v'], async () => {
     if (messages.length > 0) {
       // Find messages with images and show the most recent one
       const messagesWithImages = messages.filter(msg => msg.has_images);
@@ -1628,6 +1608,15 @@ export function createUI() {
     screen.render();
   });
 
+  input.on('cancel', () => {
+    if (threadMode) {
+      threadBox.focus();
+    } else {
+      chatBox.focus();
+    }
+    screen.render();
+  });
+
   chatBox.on('focus', () => {
     updateBorders();
     screen.render();
@@ -1968,6 +1957,70 @@ async function viewThread(threadTs) {
     statusBar.setContent(` Status: Failed to load thread - ${error.message}`);
     logError('Failed to load thread', error);
     screen.render();
+  }
+}
+
+function closeThread() {
+  threadMode = false;
+  currentThreadTs = null;
+  threadBox.hide();
+  chatBox.show();
+  input.show();
+  chatBox.focus();
+}
+
+function focusChatArea() {
+  chatBox.focus();
+  // Initialize selected message when focusing chat
+  if (messages.length > 0 && selectedMessageIndex === -1) {
+    selectedMessageIndex = messages.length - 1; // Select most recent (bottom)
+    displayMessages(messages);
+  }
+  screen.render();
+}
+
+async function openSelectedThread() {
+  if (!chatBox.focused) {
+    statusBar.setContent(' Status: Focus chat area first (press Enter)');
+    screen.render();
+    return;
+  }
+
+  if (!messages || messages.length === 0) {
+    statusBar.setContent(' Status: No messages loaded');
+    screen.render();
+    return;
+  }
+
+  // Validate selectedMessageIndex
+  if (selectedMessageIndex < 0 || selectedMessageIndex >= messages.length) {
+    statusBar.setContent(' Status: No message selected. Use arrow keys to select a message');
+    screen.render();
+    return;
+  }
+
+  const selectedMessage = messages[selectedMessageIndex];
+
+  if (!selectedMessage || !selectedMessage.ts) {
+    statusBar.setContent(' Status: Invalid message selected');
+    screen.render();
+    return;
+  }
+
+  // Show which message is being opened
+  const username = selectedMessage.user_name || selectedMessage.username || 'Unknown';
+  statusBar.setContent(` Status: Opening thread from ${username}...`);
+  screen.render();
+
+  // Check if message has thread replies
+  if (selectedMessage.reply_count && selectedMessage.reply_count > 0) {
+    await viewThread(selectedMessage.ts);
+  } else if (selectedMessage.thread_ts) {
+    // Message is part of a thread
+    await viewThread(selectedMessage.thread_ts);
+  } else {
+    // Start a new thread with this message
+    await viewThread(selectedMessage.ts);
   }
 }
 
