@@ -5,7 +5,7 @@ import { exec } from 'child_process';
 import open from 'open';
 import { logInfo, logError } from './logger.js';
 import { getCachedImage, getSwatchColor, getImageBuffer } from './image_cache.js';
-import { initKittyGraphics, isKittyGraphicsEnabled, kittyEmojiToken, setKittyRepaintHandler, prepareKittyViewerImage, clearKittyViewerImage, kittyPlaceholderCell } from './kitty_graphics.js';
+import { initKittyGraphics, isKittyGraphicsEnabled, kittyEmojiToken, kittyAttachmentToken, setKittyRepaintHandler, prepareKittyViewerImage, clearKittyViewerImage, kittyPlaceholderCell } from './kitty_graphics.js';
 import { deleteSession } from './storage.js';
 import { pickFile, clipboardImagePath } from './file_picker.js';
 import { emojify } from 'node-emoji';
@@ -75,6 +75,11 @@ let threadMode = false;
 let userSearchMode = false;
 let messages=[];
 let selectedMessageIndex=-1;
+let messageLineOffsets = [];
+let lastChatClickIndex = -1;
+let lastChatClickAt = 0;
+let selectedThreadIndex = -1;
+let threadLineOffsets = [];
 let allPublicChannels = [];
 let allUsers = [];
 let selectedSuggestion = 0;
@@ -123,6 +128,14 @@ const RAIL_ENTRIES = [
   { view: 'saved', label: '5 나중에' }
 ];
 
+const DOUBLE_CLICK_MS = 400;
+const LIST_WHEEL_STEP = 2;
+const BOX_WHEEL_STEP = 3;
+
+const INLINE_IMAGE_MAX_COLS = 24;
+const INLINE_IMAGE_MAX_ROWS = 8;
+const INLINE_IMAGE_MESSAGE_LIMIT = 20;
+
 export function createUI() {
   screen = blessed.screen({
     smartCSR: false,
@@ -160,6 +173,7 @@ export function createUI() {
     keys: true,
     vi: true,
     mouse: false,
+    autoFocus: false,
     interactive: true,
     items: RAIL_ENTRIES.map(entry => ` ${entry.label}`),
     style: {
@@ -185,6 +199,7 @@ export function createUI() {
     interactive: true,
     tags: true,
     mouse: false,
+    autoFocus: false,
     parseTags: true,
     invertSelected: false,
     style: {
@@ -209,6 +224,7 @@ export function createUI() {
     alwaysScroll: true,
     keys: false,
     vi: false,
+    autoFocus: false,
     tags: true,
     wrap: false, // We'll handle wrapping manually
     scrollbar: {
@@ -241,7 +257,8 @@ export function createUI() {
     tags: true,
     keys: true,
     vi: true,
-    mouse: true,
+    mouse: false,
+    autoFocus: false,
     scrollable: true,
     scrollbar:{
       ch: ' ',
@@ -267,7 +284,8 @@ export function createUI() {
     tags: true,
     keys: true,
     vi: true,
-    mouse: true,
+    mouse: false,
+    autoFocus: false,
     scrollable: true,
     scrollbar: {
       ch: ' ',
@@ -293,7 +311,8 @@ export function createUI() {
     tags: true,
     keys: true,
     vi: true,
-    mouse: true,
+    mouse: false,
+    autoFocus: false,
     scrollable: true,
     scrollbar: {
       ch: ' ',
@@ -352,6 +371,7 @@ export function createUI() {
     label: ' Tab to insert ',
     hidden: true,
     tags: true,
+    autoFocus: false,
     style: {
       ...getTheme().primary,
       item: getTheme().item,
@@ -611,6 +631,7 @@ export function createUI() {
     keys: true,
     vi: true,
     tags: true,
+    autoFocus: false,
     style: getTheme().primary
   });
 
@@ -687,6 +708,7 @@ export function createUI() {
     interactive: true,
     tags: true,
     mouse: false,
+    autoFocus: false,
     scrollbar: {
       ch: ' ',
       inverse: true
@@ -713,10 +735,11 @@ export function createUI() {
     hidden: true,
     scrollable: true,
     alwaysScroll: true,
-    keys: true,
-    vi: true,
+    keys: false,
+    vi: false,
     tags: true,
-    wrap: true,
+    wrap: false,
+    autoFocus: false,
     scrollbar: {
       ch: ' ',
       inverse: true
@@ -737,12 +760,114 @@ export function createUI() {
   screen.append(filesBox);
   screen.append(savedBox);
 
+  railBox.on('click', async (data) => {
+    const index = clickedListIndex(railBox, data);
+    const entry = RAIL_ENTRIES[index];
+    if (!entry) return;
+    railBox.select(index);
+    await activateRailView(entry.view);
+  });
+
+  channelList.on('click', (data) => {
+    focusWidget(channelList);
+    const index = clickedListIndex(channelList, data);
+    if (index >= 0 && displayRows[index]) channelList.enterSelected(index);
+    else screen.render();
+  });
+  channelList.on('wheeldown', () => scrollListView(channelList, LIST_WHEEL_STEP));
+  channelList.on('wheelup', () => scrollListView(channelList, -LIST_WHEEL_STEP));
+
+  chatBox.on('click', async (data) => {
+    focusWidget(chatBox);
+    const row = clickedRow(chatBox, data);
+    const index = row < 0 || messages.length === 0
+      ? -1
+      : messageIndexFromLine((chatBox.childBase || 0) + row);
+
+    if (index < 0) {
+      if (messages.length > 0 && selectedMessageIndex === -1) {
+        selectedMessageIndex = messages.length - 1;
+        displayMessages(messages);
+      }
+      screen.render();
+      return;
+    }
+
+    const now = Date.now();
+    const isDoubleClick = index === lastChatClickIndex && now - lastChatClickAt <= DOUBLE_CLICK_MS;
+    lastChatClickIndex = index;
+    lastChatClickAt = isDoubleClick ? 0 : now;
+
+    if (selectedMessageIndex !== index) {
+      selectedMessageIndex = index;
+      displayMessages(messages, true);
+    }
+
+    if (isDoubleClick) await openSelectedThread();
+    else screen.render();
+  });
+  chatBox.on('wheeldown', () => scrollBoxView(chatBox, BOX_WHEEL_STEP));
+  chatBox.on('wheelup', () => scrollBoxView(chatBox, -BOX_WHEEL_STEP));
+
+  threadBox.on('click', (data) => {
+    focusWidget(threadBox);
+    const row = clickedRow(threadBox, data);
+    const index = row < 0 || threadMessages.length === 0
+      ? -1
+      : threadIndexFromLine((threadBox.childBase || 0) + row);
+
+    if (index >= 0 && index !== selectedThreadIndex) {
+      selectedThreadIndex = index;
+      displayThread(threadMessages, true);
+      statusBar.setContent(threadStatusText());
+    }
+    screen.render();
+  });
+  threadBox.on('wheeldown', () => scrollBoxView(threadBox, BOX_WHEEL_STEP));
+  threadBox.on('wheelup', () => scrollBoxView(threadBox, -BOX_WHEEL_STEP));
+
+  input.on('click', () => {
+    if (input.hidden) return;
+    focusWidget(input);
+    screen.render();
+  });
+
+  for (const list of [activityBox, filesBox, savedBox, searchResultsBox]) {
+    list.on('click', (data) => {
+      focusWidget(list);
+      const index = clickedListIndex(list, data);
+      if (index >= 0) list.enterSelected(index);
+      else screen.render();
+    });
+    list.on('wheeldown', () => scrollListView(list, LIST_WHEEL_STEP));
+    list.on('wheelup', () => scrollListView(list, -LIST_WHEEL_STEP));
+  }
+
+  mentionBox.on('click', (data) => {
+    if (mentionBox.hidden) return;
+    const index = clickedListIndex(mentionBox, data);
+    if (index < 0) return;
+    mentionBox.select(index);
+    if (!applyMentionSelection()) return;
+    if (!input.focused) focusWidget(input);
+    screen.render();
+  });
+
+  imageViewer.on('click', () => {
+    if (imageViewer.hidden) return;
+    closeImageViewer();
+    focusWidget(imageViewerReturnTarget());
+    screen.render();
+  });
+  imageViewer.on('wheeldown', () => scrollBoxView(imageViewer, BOX_WHEEL_STEP));
+  imageViewer.on('wheelup', () => scrollBoxView(imageViewer, -BOX_WHEEL_STEP));
+
   applyRailLayout();
   updateRail();
   screen.on('resize', () => {
     if (!imageViewer.hidden) {
       closeImageViewer();
-      focusWidget(currentView === 'files' ? filesBox : chatBox);
+      focusWidget(imageViewerReturnTarget());
     }
     applyRailLayout();
     screen.render();
@@ -967,6 +1092,15 @@ export function createUI() {
 
   // Arrow keys for scrolling messages
   screen.key(['up', 'k'], () => {
+    if (threadBox.focused && threadMessages.length > 0) {
+      if (selectedThreadIndex > 0) {
+        selectedThreadIndex--;
+        displayThread(threadMessages);
+        statusBar.setContent(threadStatusText());
+        screen.render();
+      }
+      return;
+    }
     if (chatBox.focused && messages.length > 0) {
       if (selectedMessageIndex === 0) {
         loadMoreMessages();
@@ -986,6 +1120,15 @@ export function createUI() {
   });
 
   screen.key(['down', 'j'], () => {
+    if (threadBox.focused && threadMessages.length > 0) {
+      if (selectedThreadIndex < threadMessages.length - 1) {
+        selectedThreadIndex++;
+        displayThread(threadMessages);
+        statusBar.setContent(threadStatusText());
+        screen.render();
+      }
+      return;
+    }
     if (chatBox.focused && messages.length > 0) {
       // DOWN = go to newer messages (increase index, move down visually)
       if (selectedMessageIndex < messages.length - 1) {
@@ -1039,8 +1182,9 @@ export function createUI() {
       return;
     }
     const channelId = currentChannelId;
+    const inThread = threadBox.focused;
     askConfirmation('Delete this message?', async (confirmed) => {
-      focusWidget(chatBox);
+      focusWidget(inThread ? threadBox : chatBox);
       if (!confirmed) return;
       try {
         await deleteMessage(channelId, msg.ts);
@@ -1048,6 +1192,16 @@ export function createUI() {
         if (index >= 0) {
           messages.splice(index, 1);
           if (selectedMessageIndex >= messages.length) selectedMessageIndex = messages.length - 1;
+        }
+        const threadIndex = threadMessages.findIndex(m => m.ts === msg.ts);
+        if (threadIndex >= 0) {
+          threadMessages.splice(threadIndex, 1);
+          if (selectedThreadIndex >= threadMessages.length) selectedThreadIndex = threadMessages.length - 1;
+        }
+        if (inThread && threadMessages.length === 0) {
+          closeThread();
+        } else if (threadMode) {
+          displayThread(threadMessages);
         }
         displayMessages(messages);
         statusBar.setContent(' Status: Message deleted');
@@ -1237,6 +1391,8 @@ export function createUI() {
             // Reload messages
             if (threadMode) {
               const replies = await loadThreadReplies(currentChannelId, currentThreadTs);
+              threadMessages = replies;
+              selectedThreadIndex = replies.length - 1;
               displayThread(replies);
             } else {
               const msgs = await loadMessages(currentChannelId, 50);
@@ -1292,6 +1448,8 @@ export function createUI() {
 
           if (threadMode) {
             const replies = await loadThreadReplies(currentChannelId, currentThreadTs);
+            threadMessages = replies;
+            selectedThreadIndex = replies.length - 1;
             displayThread(replies);
           } else {
             const msgs = await loadMessages(currentChannelId, 50);
@@ -1407,7 +1565,7 @@ export function createUI() {
   screen.key(['escape'], () => {
     if (!imageViewer.hidden) {
       closeImageViewer();
-      focusWidget(currentView === 'files' ? filesBox : chatBox);
+      focusWidget(imageViewerReturnTarget());
     } else if (threadMode) {
       closeThread();
     } else if (globalSearchMode) {
@@ -1535,6 +1693,17 @@ export function createUI() {
       return;
     }
 
+    if (threadBox.focused) {
+      const msg = selectedThreadMessage();
+      if (msg && msg.has_images) {
+        await showImage(msg);
+      } else {
+        statusBar.setContent(' Status: No image in the selected reply');
+        screen.render();
+      }
+      return;
+    }
+
     if (messages.length > 0) {
       // Find messages with images and show the most recent one
       const messagesWithImages = messages.filter(msg => msg.has_images);
@@ -1644,6 +1813,7 @@ export function createUI() {
 
     if (sentInThread) {
       threadMessages.push(pending);
+      selectedThreadIndex = threadMessages.length - 1;
       displayThread(threadMessages);
     } else {
       messages.push(pending);
@@ -1692,7 +1862,7 @@ export function createUI() {
     reactionBox.hide();
     reactionBox.clearValue();
     reactionTargetTs = null;
-    focusWidget(chatBox);
+    focusWidget(threadMode ? threadBox : chatBox);
 
     if (!name || !ts) {
       screen.render();
@@ -1701,14 +1871,16 @@ export function createUI() {
 
     try {
       await addReaction(currentChannelId, ts, name);
-      const msg = messages.find(m => m.ts === ts);
-      if (msg) {
+      const bump = (msg) => {
+        if (!msg) return false;
         const existing = (msg.reactions || []).find(r => r.name === name);
         if (existing) existing.count += 1;
         else msg.reactions = (msg.reactions || []).concat({ name, count: 1 });
         if (msg._fmt) msg._fmt.rxSig = null;
-        displayMessages(messages);
-      }
+        return true;
+      };
+      if (bump(messages.find(m => m.ts === ts))) displayMessages(messages);
+      if (bump(threadMessages.find(m => m.ts === ts)) && threadMode) displayThread(threadMessages, true);
       statusBar.setContent(` Status: Reacted :${name}:`);
     } catch (error) {
       const code = error?.data?.error || error.message || '';
@@ -1726,7 +1898,7 @@ export function createUI() {
     reactionBox.hide();
     reactionBox.clearValue();
     reactionTargetTs = null;
-    focusWidget(chatBox);
+    focusWidget(threadMode ? threadBox : chatBox);
   });
 
   // Search box handlers
@@ -3051,9 +3223,27 @@ function applyBold(text) {
     (match, lead, body) => `${lead}{bold}${body}{/bold}`);
 }
 
-function messageTextCache(msg, contentWidth, theme) {
+function inlineImageUrl(file) {
+  return file.thumb_480 || file.thumb_360 || file.thumb_720 || file.url_private || null;
+}
+
+function inlineImageLines(msg, contentWidth) {
+  if (!isKittyGraphicsEnabled()) return [];
+  const files = msg.image_files;
+  if (!files || files.length === 0) return [];
+
+  const url = inlineImageUrl(files[0]);
+  if (!url) return [];
+
+  const maxCols = Math.min(INLINE_IMAGE_MAX_COLS, contentWidth - 6);
+  if (maxCols < 4) return [];
+
+  return kittyAttachmentToken(url, maxCols, INLINE_IMAGE_MAX_ROWS) || [];
+}
+
+function messageTextCache(msg, contentWidth, theme, allowInline) {
   let fmt = msg._fmt;
-  if (fmt && fmt.width === contentWidth && fmt.theme === theme) return fmt;
+  if (fmt && fmt.width === contentWidth && fmt.theme === theme && fmt.inlineAllowed === allowInline) return fmt;
 
   let escapedText = applyBold(processText(escapeText(msg.text || '')));
 
@@ -3062,10 +3252,18 @@ function messageTextCache(msg, contentWidth, theme) {
     escapedText = escapedText ? `${escapedText}\n\n${fileNames}` : fileNames;
   }
 
+  const imageLines = allowInline ? inlineImageLines(msg, contentWidth) : [];
+  if (imageLines.length > 0 && msg.image_files.length > 1) {
+    const others = msg.image_files.length - 1;
+    escapedText = `${escapedText}\n${theme.tags.attachment}외 ${others}장${theme.tags.reset}`;
+  }
+
   fmt = {
     width: contentWidth,
     theme,
+    inlineAllowed: allowInline,
     lines: wrapText(escapedText, contentWidth - 5),
+    imageLines,
     rxSig: null,
     rxBody: '',
     stamp: null,
@@ -3076,8 +3274,8 @@ function messageTextCache(msg, contentWidth, theme) {
   return fmt;
 }
 
-function messageBlock(msg, isSelected, contentWidth, theme) {
-  const fmt = messageTextCache(msg, contentWidth, theme);
+function messageBlock(msg, isSelected, contentWidth, theme, allowInline) {
+  const fmt = messageTextCache(msg, contentWidth, theme, allowInline);
   const rxBody = formatReactions(msg, fmt, theme);
   const username = msg.user_name || msg.username || 'Unknown';
   const own = isOwnMessage(msg);
@@ -3097,6 +3295,9 @@ function messageBlock(msg, isSelected, contentWidth, theme) {
   const headerLine = `${bar} ${selectionMarker}${userTag}{bold}${escapeText(username)}${own ? ' (me)' : ''}{/bold}${theme.tags.reset} ${theme.tags.time}• ${timestamp}${theme.tags.reset}${imageIndicator}${sendState}`;
 
   const textLines = fmt.lines.map(line => `${bar}   ${line}`).join('\n');
+  const imageBody = fmt.imageLines.length > 0
+    ? `\n${fmt.imageLines.map(line => `${bar}   ${line}`).join('\n')}`
+    : '';
 
   let threadLine = '';
   if (msg.reply_count && msg.reply_count > 0) {
@@ -3106,15 +3307,16 @@ function messageBlock(msg, isSelected, contentWidth, theme) {
   const reactionsLine = rxBody ? `\n${bar}   ${rxBody}` : '';
 
   fmt.stamp = stamp;
-  fmt.block = `${boxTop}\n${headerLine}\n${bar}\n${textLines}${reactionsLine}${threadLine}\n${boxBottom}`;
-  fmt.lineCount = 5 + Math.max(fmt.lines.length - 1, 0) + (reactionsLine ? 1 : 0) + (threadLine ? 2 : 0);
+  fmt.block = `${boxTop}\n${headerLine}\n${bar}\n${textLines}${imageBody}${reactionsLine}${threadLine}\n${boxBottom}`;
+  fmt.lineCount = 5 + Math.max(fmt.lines.length - 1, 0) + fmt.imageLines.length + (reactionsLine ? 1 : 0) + (threadLine ? 2 : 0);
   return fmt;
 }
 
-function displayMessages(msgs) {
+function displayMessages(msgs, keepScroll) {
   if (!msgs || msgs.length === 0) {
     chatBox.setContent('No messages in this channel.');
     selectedMessageIndex = -1;
+    messageLineOffsets = [];
     return;
   }
 
@@ -3139,16 +3341,30 @@ function displayMessages(msgs) {
 
   const blocks = new Array(messages.length);
   const lineCounts = new Array(messages.length);
+  const offsets = new Array(messages.length + 1);
+  offsets[0] = 0;
 
-  for (let index = 0; index < messages.length; index++) {
-    const fmt = messageBlock(messages[index], index === selectedMessageIndex, contentWidth, theme);
-    blocks[index] = fmt.block;
-    lineCounts[index] = fmt.lineCount;
+  const inlineIndexes = new Set();
+  for (let i = messages.length - 1; i >= 0 && inlineIndexes.size < INLINE_IMAGE_MESSAGE_LIMIT; i--) {
+    const files = messages[i].image_files;
+    if (files && files.length > 0) inlineIndexes.add(i);
   }
 
+  for (let index = 0; index < messages.length; index++) {
+    const fmt = messageBlock(messages[index], index === selectedMessageIndex, contentWidth, theme, inlineIndexes.has(index));
+    blocks[index] = fmt.block;
+    lineCounts[index] = fmt.lineCount;
+    offsets[index + 1] = offsets[index] + fmt.lineCount;
+  }
+
+  messageLineOffsets = offsets;
+
+  const previousScroll = chatBox.childBase || 0;
   chatBox.setContent(blocks.join('\n'));
 
-  if (selectedMessageIndex >= messages.length - 1) {
+  if (keepScroll) {
+    chatBox.scrollTo(previousScroll);
+  } else if (selectedMessageIndex >= messages.length - 1) {
     chatBox.setScrollPerc(100);
   } else if (selectedMessageIndex <= 0) {
     chatBox.setScrollPerc(0);
@@ -3180,7 +3396,8 @@ async function viewThread(threadTs) {
     threadMessages = replies;
     currentThreadTs = threadTs;
     threadMode = true;
-    
+    selectedThreadIndex = replies.length - 1;
+
     displayThread(replies);
     
     chatBox.hide();
@@ -3199,6 +3416,8 @@ async function viewThread(threadTs) {
 function closeThread() {
   threadMode = false;
   currentThreadTs = null;
+  selectedThreadIndex = -1;
+  threadLineOffsets = [];
   threadBox.hide();
   chatBox.show();
   input.show();
@@ -3259,45 +3478,103 @@ async function openSelectedThread() {
   }
 }
 
-function displayThread(replies) {
+function threadBlockLines(msg, index, isSelected, contentWidth, theme) {
+  const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
+  const username = msg.user_name || msg.username || 'Unknown';
+  const imageIndicator = msg.has_images ? ' 📷' : '';
+  const sendState = msg.failed ? ' {red-fg}✗ failed{/red-fg}' : (msg.pending ? ' ⏳' : '');
+  const isParent = index === 0;
+  const prefix = isParent ? '📌 ' : '↳ ';
+  const marker = isSelected
+    ? `{${theme.message.selectionMarker}-fg}➤{/${theme.message.selectionMarker}-fg} `
+    : '  ';
+
+  let body = applyBold(processText(escapeText(msg.text || '')));
+  if (msg.files && msg.files.length > 0) {
+    const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
+    body = body ? `${body}\n${fileNames}` : fileNames;
+  }
+
+  const indent = isParent ? '  ' : '      ';
+  const header = `${marker}${prefix}[${timestamp}] ${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset}:${imageIndicator}${sendState}`;
+  const bodyLines = wrapText(body, Math.max(20, contentWidth - indent.length));
+
+  return [header, ...bodyLines.map(line => `${indent}${line}`)];
+}
+
+function displayThread(replies, keepScroll) {
   if (!replies || replies.length === 0) {
     threadBox.setContent('No replies in this thread.');
+    selectedThreadIndex = -1;
+    threadLineOffsets = [];
     return;
   }
+
   const theme = getTheme();
-  if (!theme || !theme.tags) {
+  if (!theme || !theme.tags || !theme.message) {
       threadBox.setContent('Error: Theme definition is incomplete.');
       return;
   }
 
-  const formattedReplies = replies.map((msg, index) => {
-    const timestamp = new Date(parseFloat(msg.ts) * 1000).toLocaleString();
-    const username = msg.user_name || msg.username || 'Unknown';
-    const imageIndicator = msg.has_images ? ' 📷' : '';
-    const isParent = index === 0;
-    const prefix = isParent ? '📌 ' : '  ↳ ';
-    
-    let text = msg.text || '';
-    text = processText(text);
-    let escapedText = escapeText(text);
+  if (selectedThreadIndex < 0 || selectedThreadIndex >= replies.length) {
+    selectedThreadIndex = replies.length - 1;
+  }
 
-    if (msg.files && msg.files.length > 0) {
-      const fileNames = msg.files.map(f => `${theme.tags.attachment}📎 ${f.name}${theme.tags.reset}`).join('\n');
-      if (escapedText) {
-        escapedText += '\n' + fileNames;
-      } else {
-        escapedText = fileNames;
-      }
+  const contentWidth = Math.max(30, Number(threadBox.width) - 4);
+  const rendered = [];
+  const offsets = new Array(replies.length + 1);
+
+  for (let index = 0; index < replies.length; index++) {
+    offsets[index] = rendered.length;
+    if (index > 0) rendered.push('');
+    for (const line of threadBlockLines(replies[index], index, index === selectedThreadIndex, contentWidth, theme)) {
+      rendered.push(line);
     }
+  }
+  offsets[replies.length] = rendered.length;
+  threadLineOffsets = offsets;
 
-    const content = escapedText ? `\n${isParent ? '' : '    '}${escapedText}` : '';
+  const previousScroll = threadBox.childBase || 0;
+  threadBox.setContent(rendered.join('\n'));
 
-    return `${prefix}[${timestamp}] ${theme.tags.user}{bold}${escapeText(username)}{/bold}${theme.tags.reset}:${imageIndicator}${content}`;
-  }).join('\n\n');
+  if (keepScroll) {
+    threadBox.scrollTo(previousScroll);
+  } else if (selectedThreadIndex >= replies.length - 1) {
+    threadBox.setScrollPerc(100);
+  } else if (selectedThreadIndex <= 0) {
+    threadBox.setScrollPerc(0);
+  } else {
+    const selectedTop = offsets[selectedThreadIndex];
+    const selectedHeight = offsets[selectedThreadIndex + 1] - selectedTop;
+    const viewportHeight = Number(threadBox.height) - 2;
+    const target = Number.isFinite(viewportHeight)
+      ? selectedTop - Math.floor((viewportHeight - selectedHeight) / 2)
+      : selectedTop;
+    const maxScroll = Math.max(0, threadBox.getScrollHeight() - Math.max(1, viewportHeight));
+    threadBox.scrollTo(Math.min(Math.max(0, target), maxScroll));
+  }
 
-  threadBox.setContent(formattedReplies);
-  threadBox.setScrollPerc(100);
   screen.render();
+}
+
+function threadIndexFromLine(line) {
+  if (line < 0 || threadLineOffsets.length !== threadMessages.length + 1) return -1;
+  for (let i = 0; i < threadLineOffsets.length - 1; i++) {
+    if (line < threadLineOffsets[i + 1]) return i;
+  }
+  return -1;
+}
+
+function selectedThreadMessage() {
+  if (selectedThreadIndex < 0 || selectedThreadIndex >= threadMessages.length) return null;
+  return threadMessages[selectedThreadIndex] || null;
+}
+
+function threadStatusText() {
+  const msg = selectedThreadMessage();
+  if (!msg) return ' Status: Viewing thread';
+  const username = msg.user_name || msg.username || 'Unknown';
+  return ` Status: Thread ${selectedThreadIndex + 1}/${threadMessages.length} - ${username}`;
 }
 
 function displaySearchResults(results, query) {
@@ -3520,6 +3797,51 @@ function installNewlineKeys() {
   };
 }
 
+function clickedRow(widget, data) {
+  if (!widget || !widget.lpos || !data) return -1;
+  const row = data.y - widget.atop - widget.itop;
+  const inner = Number(widget.height) - widget.iheight;
+  if (row < 0 || !Number.isFinite(inner) || row >= inner) return -1;
+  return row;
+}
+
+function clickedListIndex(list, data) {
+  const row = clickedRow(list, data);
+  if (row < 0) return -1;
+  const index = (list.childBase || 0) + row;
+  return index < list.items.length ? index : -1;
+}
+
+function scrollListView(list, delta) {
+  if (!list || list.items.length === 0) return;
+  const visible = Number(list.height) - list.iheight;
+  const max = Math.max(0, list.items.length - visible);
+  const next = Math.min(max, Math.max(0, (list.childBase || 0) + delta));
+  if (next === list.childBase) return;
+  list.childBase = next;
+  list.childOffset = 0;
+  screen.render();
+}
+
+function scrollBoxView(box, delta) {
+  if (!box || box.hidden) return;
+  box.scroll(delta);
+  screen.render();
+}
+
+function messageIndexFromLine(line) {
+  if (line < 0 || messageLineOffsets.length !== messages.length + 1) return -1;
+  for (let i = 0; i < messageLineOffsets.length - 1; i++) {
+    if (line < messageLineOffsets[i + 1]) return i;
+  }
+  return -1;
+}
+
+function imageViewerReturnTarget() {
+  if (currentView === 'files') return filesBox;
+  return threadMode ? threadBox : chatBox;
+}
+
 function focusWidget(widget) {
   if (!widget || !screen || screen.focused === widget) return;
 
@@ -3530,6 +3852,7 @@ function focusWidget(widget) {
 }
 
 function selectedMessage() {
+  if (threadBox && threadBox.focused) return selectedThreadMessage();
   if (!chatBox || !chatBox.focused) return null;
   if (selectedMessageIndex < 0 || selectedMessageIndex >= messages.length) return null;
   return messages[selectedMessageIndex] || null;
@@ -3559,7 +3882,7 @@ async function saveEdit(value) {
   const text = (value || '').trim();
   editingTs = null;
   input.clearValue();
-  focusWidget(chatBox);
+  focusWidget(threadMode ? threadBox : chatBox);
 
   if (!text) {
     statusBar.setContent(' Status: Edit cancelled (empty message)');
@@ -3569,13 +3892,15 @@ async function saveEdit(value) {
 
   try {
     await editMessage(currentChannelId, ts, resolveMentions(text));
-    const msg = messages.find(m => m.ts === ts);
-    if (msg) {
+    const apply = (msg) => {
+      if (!msg) return false;
       msg.text = text;
       msg.raw_text = text;
       msg._fmt = null;
-      displayMessages(messages);
-    }
+      return true;
+    };
+    if (apply(messages.find(m => m.ts === ts))) displayMessages(messages);
+    if (apply(threadMessages.find(m => m.ts === ts)) && threadMode) displayThread(threadMessages, true);
     statusBar.setContent(' Status: Message edited');
     logInfo(`Message ${ts} edited in ${currentChannelId}`);
   } catch (error) {

@@ -30,8 +30,10 @@ const EMOJI_COLS = 2;
 const EMOJI_ROWS = 1;
 const CHUNK_SIZE = 4096;
 
-const MIN_IMAGE_ID = 16;
-const MAX_IMAGE_ID = 254;
+const MIN_EMOJI_IMAGE_ID = 16;
+const MAX_EMOJI_IMAGE_ID = 199;
+const MIN_ATTACHMENT_IMAGE_ID = 200;
+const MAX_ATTACHMENT_IMAGE_ID = 254;
 const VIEWER_IMAGE_ID = 255;
 const MAX_GRID_SPAN = ROWCOLUMN_DIACRITICS.length;
 const CELL_ASPECT = 2;
@@ -47,7 +49,7 @@ let repaintHandler = null;
 const ready = new Map();
 const failed = new Set();
 const queued = new Set();
-const usageOrder = [];
+const usageOrder = { emoji: [], attachment: [] };
 let fetchQueue = [];
 let fetchActive = 0;
 let readyBatch = 0;
@@ -124,14 +126,20 @@ export function setKittyRepaintHandler(fn) {
   repaintHandler = fn;
 }
 
-export function buildPlaceholder(imageId, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
-  let out = `\x1b[38;5;${imageId}m`;
+export function buildPlaceholderLines(imageId, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
+  const lines = [];
   for (let row = 0; row < rows; row++) {
+    let out = `\x1b[38;5;${imageId}m`;
     for (let col = 0; col < cols; col++) {
       out += PLACEHOLDER + ROWCOLUMN_DIACRITICS[row] + ROWCOLUMN_DIACRITICS[col];
     }
+    lines.push(out + '\x1b[39m');
   }
-  return out + '\x1b[39m';
+  return lines;
+}
+
+export function buildPlaceholder(imageId, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
+  return buildPlaceholderLines(imageId, cols, rows).join('');
 }
 
 export function buildTransmitSequences(imageId, base64, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
@@ -212,36 +220,61 @@ export function clearKittyViewerImage() {
 }
 
 export function kittyEmojiToken(name, url) {
-  if (!enabled || failed.has(name)) return null;
+  const key = `emoji:${name}`;
+  if (!enabled || failed.has(key)) return null;
 
-  const entry = ready.get(name);
+  const entry = ready.get(key);
   if (entry) {
-    touch(name);
+    touch('emoji', key);
     return entry.placeholder;
   }
 
-  if (!queued.has(name)) {
-    queued.add(name);
-    fetchQueue.push({ name, url });
+  if (!queued.has(key)) {
+    queued.add(key);
+    fetchQueue.push({ key, kind: 'emoji', label: name, url });
     drainFetchQueue();
   }
   return null;
 }
 
-function touch(name) {
-  const at = usageOrder.indexOf(name);
-  if (at !== -1) usageOrder.splice(at, 1);
-  usageOrder.push(name);
+export function kittyAttachmentToken(url, maxCols, maxRows) {
+  if (!enabled || !url) return null;
+
+  const key = `attachment:${maxCols}x${maxRows}:${url}`;
+  if (failed.has(key)) return null;
+
+  const entry = ready.get(key);
+  if (entry) {
+    touch('attachment', key);
+    return entry.lines;
+  }
+
+  if (!queued.has(key)) {
+    queued.add(key);
+    fetchQueue.push({ key, kind: 'attachment', label: url, url, maxCols, maxRows });
+    drainFetchQueue();
+  }
+  return null;
 }
 
-function allocateImageId() {
+function touch(kind, key) {
+  const order = usageOrder[kind];
+  const at = order.indexOf(key);
+  if (at !== -1) order.splice(at, 1);
+  order.push(key);
+}
+
+function allocateImageId(kind) {
+  const min = kind === 'attachment' ? MIN_ATTACHMENT_IMAGE_ID : MIN_EMOJI_IMAGE_ID;
+  const max = kind === 'attachment' ? MAX_ATTACHMENT_IMAGE_ID : MAX_EMOJI_IMAGE_ID;
+
   const used = new Set();
   for (const entry of ready.values()) used.add(entry.id);
-  for (let id = MIN_IMAGE_ID; id <= MAX_IMAGE_ID; id++) {
+  for (let id = min; id <= max; id++) {
     if (!used.has(id)) return id;
   }
 
-  const victim = usageOrder.shift();
+  const victim = usageOrder[kind].shift();
   if (victim === undefined) return null;
   const entry = ready.get(victim);
   ready.delete(victim);
@@ -277,32 +310,44 @@ async function toPngBuffer(buffer) {
   return Buffer.isBuffer(out) ? out : Buffer.from(out);
 }
 
-async function transmit(name, rawBuffer) {
+async function transmit(job, rawBuffer) {
   let buffer;
   try {
     buffer = await toPngBuffer(rawBuffer);
   } catch (error) {
-    logError(`Kitty emoji convert failed: ${name}`, error);
-    failed.add(name);
+    logError(`Kitty ${job.kind} convert failed: ${job.label}`, error);
+    failed.add(job.key);
     return false;
   }
 
-  const imageId = allocateImageId();
+  let cols = EMOJI_COLS;
+  let rows = EMOJI_ROWS;
+  if (job.kind === 'attachment') {
+    const size = readPngSize(buffer);
+    if (!size) {
+      failed.add(job.key);
+      return false;
+    }
+    ({ cols, rows } = fitToCells(size.width, size.height, job.maxCols, job.maxRows));
+  }
+
+  const imageId = allocateImageId(job.kind);
   if (imageId === null) {
-    failed.add(name);
+    failed.add(job.key);
     return false;
   }
 
-  const sequences = buildTransmitSequences(imageId, buffer.toString('base64'));
+  const sequences = buildTransmitSequences(imageId, buffer.toString('base64'), cols, rows);
   for (const sequence of sequences) {
     if (!write(sequence)) {
-      failed.add(name);
+      failed.add(job.key);
       return false;
     }
   }
 
-  ready.set(name, { id: imageId, placeholder: buildPlaceholder(imageId) });
-  touch(name);
+  const lines = buildPlaceholderLines(imageId, cols, rows);
+  ready.set(job.key, { id: imageId, placeholder: lines.join(''), lines });
+  touch(job.kind, job.key);
   return true;
 }
 
@@ -313,18 +358,18 @@ function drainFetchQueue() {
     getImageBuffer(job.url, tokenProvider ? tokenProvider() : undefined)
       .then((buffer) => {
         if (!buffer) {
-          failed.add(job.name);
+          failed.add(job.key);
           return;
         }
-        return transmit(job.name, buffer).then(ok => { if (ok) readyBatch++; });
+        return transmit(job, buffer).then(ok => { if (ok) readyBatch++; });
       })
       .catch((error) => {
-        logError(`Kitty emoji transmit failed: ${job.name}`, error);
-        failed.add(job.name);
+        logError(`Kitty ${job.kind} transmit failed: ${job.label}`, error);
+        failed.add(job.key);
       })
       .finally(() => {
         fetchActive--;
-        queued.delete(job.name);
+        queued.delete(job.key);
         if (fetchQueue.length > 0) {
           drainFetchQueue();
           return;
@@ -347,7 +392,8 @@ export function resetKittyGraphicsForTest() {
   ready.clear();
   failed.clear();
   queued.clear();
-  usageOrder.length = 0;
+  usageOrder.emoji.length = 0;
+  usageOrder.attachment.length = 0;
   fetchQueue = [];
   fetchActive = 0;
   readyBatch = 0;
