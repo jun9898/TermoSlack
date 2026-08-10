@@ -12,6 +12,9 @@ let globalSearchBox, searchResultsBox, threadBox, userSearchBox, userSuggestions
 let channels = [];
 let sections = null;
 let displayRows = [];
+let unreads = new Map();
+let hasUnreadData = false;
+let locallyRead = new Set();
 let currentChannelId = null;
 let currentView = 'channels'; // 'channels' or 'dms'
 let searchMode = false;
@@ -1643,7 +1646,8 @@ async function selectChannel(index) {
   const selectedChannel = displayRows[index];
   if (selectedChannel) {
     currentChannelId = selectedChannel.id;
-    const displayName = selectedChannel.is_private 
+    markChannelRead(selectedChannel.id);
+    const displayName = selectedChannel.is_private
       ? `🔒 ${selectedChannel.name}` 
       : selectedChannel.type === 'channel' 
         ? `# ${selectedChannel.name}` 
@@ -1687,8 +1691,37 @@ function updateButtonStyles() {
   screen.render();
 }
 
+function mutedTag() {
+  const tags = getTheme().tags || {};
+  const open = tags.time || '';
+  return { open, close: open ? (tags.reset || '{/}') : '' };
+}
+
+function mentionBadge(unread) {
+  return unread && unread.mentionCount > 0 ? ` (${unread.mentionCount})` : '';
+}
+
 function formatChannelItem(ch) {
-  return (ch.is_private ? '🔒 ' : '# ') + ch.name;
+  const prefix = ch.is_private ? '🔒 ' : '# ';
+  if (!hasUnreadData) return prefix + ch.name;
+
+  const unread = unreads.get(ch.id);
+  const label = ch.name + mentionBadge(unread);
+  if (unread) return `${prefix}{bold}${label}{/bold}`;
+
+  const muted = mutedTag();
+  return `${prefix}${muted.open}${label}${muted.close}`;
+}
+
+function formatDMItem(ch) {
+  if (!hasUnreadData) return '💬 {bold}' + ch.name + '{/bold}';
+
+  const unread = unreads.get(ch.id);
+  const label = ch.name + mentionBadge(unread);
+  if (unread) return `💬 {bold}${label}{/bold}`;
+
+  const muted = mutedTag();
+  return `💬 ${muted.open}${label}${muted.close}`;
 }
 
 function formatSectionHeader(name) {
@@ -1820,7 +1853,7 @@ function updateView() {
       );
     }
     
-    const dmItems = filteredChannels.map(ch => '💬 {bold}' + ch.name + '{/bold}');
+    const dmItems = filteredChannels.map(ch => formatDMItem(ch));
     displayRows = filteredChannels.slice();
     channelList.setItems(dmItems);
     
@@ -1840,20 +1873,59 @@ export function setChannels(channelData) {
   updateView(); // Apply current view filter
 }
 
-export function setSections(sectionData) {
-  sections = Array.isArray(sectionData) && sectionData.length > 0 ? sectionData : null;
-
-  if (!channelList || currentView !== 'channels') return;
+function refreshChannelList() {
+  if (!channelList || (currentView !== 'channels' && currentView !== 'dms')) return;
 
   const previouslyFocused = screen ? screen.focused : null;
+  const cursorRow = displayRows[channelList.selected];
+  const cursorChannelId = cursorRow ? cursorRow.id : currentChannelId;
+
   updateView();
-  selectChannelRow(currentChannelId);
+  selectChannelRow(cursorChannelId);
   moveOffSectionHeader(1);
 
   if (previouslyFocused && previouslyFocused !== channelList && typeof previouslyFocused.focus === 'function') {
     previouslyFocused.focus();
   }
   if (screen) screen.render();
+}
+
+export function setSections(sectionData) {
+  sections = Array.isArray(sectionData) && sectionData.length > 0 ? sectionData : null;
+  refreshChannelList();
+}
+
+function unreadsEqual(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [id, value] of a) {
+    const other = b.get(id);
+    if (!other || other.mentionCount !== value.mentionCount) return false;
+  }
+  return true;
+}
+
+export function setUnreads(counts) {
+  if (!(counts instanceof Map)) return;
+
+  for (const id of locallyRead) counts.delete(id);
+  locallyRead.clear();
+
+  const unchanged = hasUnreadData && unreadsEqual(counts, unreads);
+  unreads = counts;
+  hasUnreadData = true;
+  if (unchanged) return;
+
+  logInfo(`Unread state changed: ${unreads.size} conversation(s) unread`);
+  refreshChannelList();
+}
+
+function markChannelRead(channelId) {
+  if (!hasUnreadData || !channelId) return;
+
+  locallyRead.add(channelId);
+  if (!unreads.delete(channelId)) return;
+
+  refreshChannelList();
 }
 
 export function updateStatus(message) {

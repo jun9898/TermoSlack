@@ -1,5 +1,6 @@
-import { createUI, setChannels, setSections, setReloadChannelsCallback } from './ui.js';
+import { createUI, setChannels, setSections, setUnreads, setReloadChannelsCallback } from './ui.js';
 import { fetchChannelSections } from './sections.js';
+import { fetchUnreadCounts } from './unreads.js';
 import { createAuthServer, getAuthUrl } from './auth_server.js';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -49,6 +50,7 @@ async function main() {
   let currentUserSession = null;
   let uiCreated = false;
   let authCheckInterval = null;
+  let unreadPollTimer = null;
 
   // Function to create UI and load channels
   async function initializeApp() {
@@ -59,6 +61,8 @@ async function main() {
     }
     await loadUserChannels();
     loadChannelSections();
+    loadUnreadCounts();
+    startUnreadPolling();
 
     // Stop checking for auth once initialized
     if (authCheckInterval) {
@@ -163,6 +167,21 @@ async function main() {
       }
     }
   }, 2000); // Check every 2 seconds
+
+  async function loadUnreadCounts() {
+    try {
+      const counts = await fetchUnreadCounts();
+      if (!counts) return;
+      setUnreads(counts);
+    } catch (e) {
+      logError('Failed to apply unread counts', e);
+    }
+  }
+
+  function startUnreadPolling() {
+    if (unreadPollTimer) return;
+    unreadPollTimer = setInterval(loadUnreadCounts, 60000);
+  }
 
   async function loadChannelSections() {
     try {
