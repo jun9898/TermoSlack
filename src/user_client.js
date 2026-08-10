@@ -349,9 +349,12 @@ function decorateMessage(msg) {
 
   const imageFiles = hasImages ? msg.files.filter(f => f.mimetype?.startsWith('image/')) : [];
 
+  const displayText = extractDisplayText(msg);
+
   return {
     ...msg,
-    text: formatLinks(replaceMentions(extractDisplayText(msg))),
+    text: formatLinks(replaceMentions(displayText)),
+    raw_text: displayText,
     user_name: userName,
     has_images: hasImages,
     image_files: imageFiles
@@ -394,6 +397,29 @@ export async function loadMessages(channelId, limit = 20, oldest = undefined) {
     logError(`Failed to load messages from channel ${channelId}`, error);
     throw error;
   }
+}
+
+export async function editMessage(channelId, ts, text) {
+    const result = await userClient.chat.update({ channel: channelId, ts, text });
+    logInfo(`Message ${ts} edited in ${channelId}`);
+    return result;
+}
+
+export async function deleteMessage(channelId, ts) {
+    const result = await userClient.chat.delete({ channel: channelId, ts });
+    logInfo(`Message ${ts} deleted in ${channelId}`);
+    return result;
+}
+
+export async function addReaction(channelId, ts, name) {
+    const result = await userClient.reactions.add({ channel: channelId, timestamp: ts, name });
+    logInfo(`Reaction :${name}: added to ${ts} in ${channelId}`);
+    return result;
+}
+
+export async function getPermalink(channelId, ts) {
+    const result = await userClient.chat.getPermalink({ channel: channelId, message_ts: ts });
+    return result.permalink;
 }
 
 export async function loadThreadReplies(channelId, threadTs) {
