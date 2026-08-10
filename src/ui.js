@@ -1006,7 +1006,7 @@ export function createUI() {
   // O key - Open image in browser
   screen.key(['o'], async () => {
     if (isTyping()) return;
-    if (!imageViewer.hidden && imageViewer.currentImageUrl) {
+    if (imageViewer.currentImageUrl) {
       try {
         const open = (await import('open')).default;
         await open(imageViewer.currentImageUrl);
@@ -2492,33 +2492,38 @@ async function showImage(message) {
                      imageFile.thumb_360 ||
                      imageFile.thumb_80;
     
-    // Calculate available space for image - FULL SCREEN
-    const availableWidth = screen.width;
-    const availableHeight = screen.height;
+    // Calculate available space for image - capped so blessed can render it
+    const availableWidth = Math.min(screen.width, 120);
+    const availableHeight = Math.min(screen.height, 40);
 
     const imageText = await getCachedImage(imageUrl, token, {
       width: availableWidth,
       height: availableHeight
     });
-    
+
     const imageInfo = `File: ${imageFile.name} | Size: ${(imageFile.size / 1024).toFixed(1)} KB`;
-    
+
     // Update info overlay
     if (imageViewer.infoBox) {
       imageViewer.infoBox.setContent(` {bold}${imageInfo}{/bold} | Press Esc to close | O to open in browser`);
     }
-    
+
     imageViewer.setContent(imageText);
     imageViewer.show();
     imageViewer.focus();
-    
+
     // Store current image URL for browser opening
     imageViewer.currentImageUrl = imageFile.permalink || imageFile.url_private;
-    
+
     screen.render();
   } catch (error) {
-    statusBar.setContent(` Status: Failed to load image - ${error.message}`);
+    statusBar.setContent(` Status: Failed to load image - ${error.message} (O to open in browser)`);
     logError('Failed to show image', error);
+    imageViewer.hide();
+    if (message.image_files[0]) {
+      imageViewer.currentImageUrl = message.image_files[0].permalink || message.image_files[0].url_private;
+    }
+    screen.realloc();
     screen.render();
   }
 }
