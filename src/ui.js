@@ -3,7 +3,7 @@ import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadRepl
 import { logInfo, logError } from './logger.js';
 import { getCachedImage } from './image_cache.js';
 import { deleteSession } from './storage.js';
-import { pickFile } from './file_picker.js';
+import { pickFile, clipboardImagePath } from './file_picker.js';
 import { emojify } from 'node-emoji';
 import { getTheme, cycleTheme } from './themes.js';
 
@@ -873,6 +873,57 @@ export function createUI() {
       statusBar.setContent(` Status: File picker error - ${error.message}`);
       screen.render();
     }
+  });
+
+  // Ctrl+V - Upload clipboard image
+  screen.key(['C-v'], async () => {
+    if (!currentChannelId) {
+      statusBar.setContent(' Status: Select a channel first');
+      screen.render();
+      return;
+    }
+
+    statusBar.setContent(' Status: Reading clipboard...');
+    screen.render();
+
+    const imagePath = await clipboardImagePath();
+    if (!imagePath) {
+      statusBar.setContent(' Status: No image in clipboard');
+      screen.render();
+      return;
+    }
+
+    askConfirmation('Upload clipboard image?', async (result) => {
+      if (result) {
+        statusBar.setContent(' Status: Uploading clipboard image...');
+        screen.render();
+
+        try {
+          const threadTs = threadMode ? currentThreadTs : null;
+          await uploadFile(currentChannelId, imagePath, undefined, threadTs);
+
+          statusBar.setContent(' Status: Image uploaded successfully ✓');
+          statusBar.style.fg = 'green';
+
+          if (threadMode) {
+            const replies = await loadThreadReplies(currentChannelId, currentThreadTs);
+            displayThread(replies);
+          } else {
+            const msgs = await loadMessages(currentChannelId, 50);
+            messages = msgs;
+            selectedMessageIndex = messages.length - 1;
+            displayMessages(messages);
+          }
+        } catch (error) {
+          statusBar.setContent(` Status: Upload failed - ${error.message}`);
+          statusBar.style.fg = 'red';
+        }
+        screen.render();
+      } else {
+        statusBar.setContent(' Status: Upload cancelled');
+        screen.render();
+      }
+    });
   });
 
   // Ctrl+J or F7 - Join channel

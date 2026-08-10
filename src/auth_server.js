@@ -22,6 +22,7 @@ const userScopes = [
         "im:write",
         "im:history",
         "files:read",
+        "files:write",
         "search:read"
 ].join(',');
 

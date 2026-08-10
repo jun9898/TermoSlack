@@ -1,5 +1,31 @@
 import { exec } from 'child_process';
 import os from 'os';
+import path from 'path';
+
+export function clipboardImagePath() {
+  return new Promise((resolve) => {
+    if (os.platform() !== 'darwin') {
+      resolve(null);
+      return;
+    }
+
+    const target = path.join(os.tmpdir(), `termoslack-paste-${Date.now()}.png`);
+    const appleScript = [
+      `set pngData to the clipboard as «class PNGf»`,
+      `set f to open for access POSIX file "${target}" with write permission`,
+      `write pngData to f`,
+      `close access f`
+    ].map(line => `-e '${line}'`).join(' ');
+
+    exec(`osascript ${appleScript}`, (error) => {
+      if (error) {
+        resolve(null);
+        return;
+      }
+      resolve(target);
+    });
+  });
+}
 
 export function pickFile() {
   return new Promise((resolve, reject) => {
