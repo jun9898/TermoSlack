@@ -621,6 +621,14 @@ export async function logoutUser() {
   }
 }
 
+export function seedUserNames(users) {
+    for (const user of users) {
+        if (!user?.id || userNameCache.has(user.id)) continue;
+        const name = resolveUserName(user);
+        if (name) userNameCache.set(user.id, name);
+    }
+}
+
 let selfName = null;
 
 export async function getSelfName() {

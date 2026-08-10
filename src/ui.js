@@ -1,5 +1,5 @@
 import blessed from 'neo-blessed';
-import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName } from './user_client.js';
+import { sendMessage, loadMessages, getUserToken, searchMessages, loadThreadReplies, getCurrentUserId, uploadFile, getCustomEmojis, getSelfName, seedUserNames } from './user_client.js';
 import { logInfo, logError } from './logger.js';
 import { getCachedImage } from './image_cache.js';
 import { deleteSession } from './storage.js';
@@ -2589,10 +2589,11 @@ async function preloadUsers() {
         cursor: cursor
       });
 
-      const users = (result.members || []).filter(u => 
+      const users = (result.members || []).filter(u =>
         !u.is_bot && !u.deleted && u.id !== 'USLACKBOT'
       );
 
+      seedUserNames(result.members || []);
       allWorkspaceUsers = allWorkspaceUsers.concat(users);
       totalLoaded += users.length;
       
