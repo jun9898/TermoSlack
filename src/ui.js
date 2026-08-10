@@ -1082,6 +1082,10 @@ export function createUI() {
   screen.key(['l'], async () => {
     if (isTyping()) return;
     if (channelList.focused) {
+      const row = displayRows[channelList.selected];
+      if (row && row.id !== currentChannelId) {
+        await selectChannel(channelList.selected);
+      }
       focusChatArea();
       return;
     }
