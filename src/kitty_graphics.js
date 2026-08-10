@@ -40,6 +40,16 @@ const CELL_ASPECT = 2;
 const MAX_CONCURRENT_FETCH = 4;
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const GIF_MAGIC = Buffer.from('GIF8', 'latin1');
+const PLACEHOLDER_CODEPOINT = 0x10EEEE;
+
+const ANIM_MAX_FRAMES = 20;
+const ANIM_MAX_EDGE = 48;
+const ANIM_MIN_INTERVAL_MS = 100;
+const ANIM_MAX_ACTIVE = 6;
+const ANIM_MAX_TOTAL_BYTES = 512 * 1024;
+const ANIM_CACHE_LIMIT = 12;
+const ANIM_SYNC_DEBOUNCE_MS = 50;
 
 let enabled = false;
 let program = null;
@@ -55,6 +65,14 @@ let fetchActive = 0;
 let readyBatch = 0;
 let viewerActive = false;
 let tmuxWrap = false;
+
+const animFrames = new Map();
+const animOrder = [];
+const animPending = new Set();
+const animFailed = new Set();
+const animActive = new Map();
+let screenRef = null;
+let animSyncTimer = null;
 
 function isInsideTmux(env) {
   return !!env.TMUX || env.TERM_PROGRAM === 'tmux' || /^(screen|tmux)([.-]|$)/.test(env.TERM || '');
@@ -110,6 +128,10 @@ export function initKittyGraphics(screen, getToken) {
     tokenProvider = getToken;
     tmuxWrap = needsTmuxPassthrough();
     enabled = true;
+    if (screenRef !== screen) {
+      screenRef = screen;
+      if (typeof screen.on === 'function') screen.on('render', requestAnimationSync);
+    }
     logInfo(`Kitty inline emoji enabled (TERM=${process.env.TERM}${tmuxWrap ? ', tmux passthrough' : ''})`);
     return true;
   } catch (error) {
@@ -142,18 +164,24 @@ export function buildPlaceholder(imageId, cols = EMOJI_COLS, rows = EMOJI_ROWS) 
   return buildPlaceholderLines(imageId, cols, rows).join('');
 }
 
-export function buildTransmitSequences(imageId, base64, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
+function chunkSequences(base64, firstKeys) {
   const chunks = [];
   for (let i = 0; i < base64.length; i += CHUNK_SIZE) chunks.push(base64.slice(i, i + CHUNK_SIZE));
   if (chunks.length === 0) chunks.push('');
 
   return chunks.map((chunk, index) => {
     const more = index < chunks.length - 1 ? 1 : 0;
-    const keys = index === 0
-      ? `a=T,U=1,i=${imageId},f=100,t=d,c=${cols},r=${rows},q=2,m=${more}`
-      : `m=${more}`;
+    const keys = index === 0 ? `${firstKeys},m=${more}` : `m=${more}`;
     return `\x1b_G${keys};${chunk}\x1b\\`;
   });
+}
+
+export function buildTransmitSequences(imageId, base64, cols = EMOJI_COLS, rows = EMOJI_ROWS) {
+  return chunkSequences(base64, `a=T,U=1,i=${imageId},f=100,t=d,c=${cols},r=${rows},q=2`);
+}
+
+export function buildFrameSequences(imageId, base64) {
+  return chunkSequences(base64, `a=t,i=${imageId},f=100,t=d,q=2`);
 }
 
 export function buildDeleteSequence(imageId) {
@@ -278,6 +306,7 @@ function allocateImageId(kind) {
   if (victim === undefined) return null;
   const entry = ready.get(victim);
   ready.delete(victim);
+  forgetAnimation(victim);
   if (entry) {
     write(buildDeleteSequence(entry.id));
     return entry.id;
@@ -346,9 +375,259 @@ async function transmit(job, rawBuffer) {
   }
 
   const lines = buildPlaceholderLines(imageId, cols, rows);
-  ready.set(job.key, { id: imageId, placeholder: lines.join(''), lines });
+  const animated = job.kind === 'emoji' && isGifBuffer(rawBuffer);
+  ready.set(job.key, { id: imageId, placeholder: lines.join(''), lines, cols, rows, url: job.url, animated });
   touch(job.kind, job.key);
   return true;
+}
+
+function isGifBuffer(buffer) {
+  return Buffer.isBuffer(buffer)
+    && buffer.length >= 6
+    && buffer.subarray(0, 4).equals(GIF_MAGIC)
+    && (buffer[4] === 0x37 || buffer[4] === 0x39)
+    && buffer[5] === 0x61;
+}
+
+function decodeGifCanvases(buffer, GifReader) {
+  const reader = new GifReader(buffer);
+  const width = reader.width;
+  const height = reader.height;
+  if (!width || !height) return null;
+
+  const total = Math.min(reader.numFrames(), ANIM_MAX_FRAMES);
+  if (total < 2) return null;
+
+  const canvas = new Uint8ClampedArray(width * height * 4);
+  const frames = [];
+  let saved = null;
+
+  for (let index = 0; index < total; index++) {
+    const info = reader.frameInfo(index);
+    if (info.disposal === 3) saved = canvas.slice();
+
+    reader.decodeAndBlitFrameRGBA(index, canvas);
+    frames.push({ data: Buffer.from(canvas), delay: info.delay });
+
+    const left = Math.max(0, Math.min(width, info.x));
+    const right = Math.max(left, Math.min(width, info.x + info.width));
+    const top = Math.max(0, Math.min(height, info.y));
+    const bottom = Math.max(top, Math.min(height, info.y + info.height));
+
+    if (info.disposal === 2) {
+      for (let y = top; y < bottom; y++) {
+        const base = (y * width + left) * 4;
+        canvas.fill(0, base, base + (right - left) * 4);
+      }
+    } else if (info.disposal === 3 && saved) {
+      canvas.set(saved);
+    }
+  }
+
+  return { width, height, frames };
+}
+
+async function buildAnimationFrames(buffer) {
+  const omggif = await import('omggif');
+  const GifReader = omggif.GifReader || omggif.default?.GifReader;
+  if (!GifReader) return null;
+
+  const originalLog = console.log;
+  let decoded;
+  try {
+    console.log = () => {};
+    decoded = decodeGifCanvases(buffer, GifReader);
+  } finally {
+    console.log = originalLog;
+  }
+  if (!decoded) return null;
+
+  const jimpModule = await import('jimp');
+  const Jimp = jimpModule.Jimp || jimpModule.default;
+  const { width, height } = decoded;
+  const scale = Math.min(1, ANIM_MAX_EDGE / Math.max(width, height));
+  const targetWidth = Math.max(1, Math.round(width * scale));
+  const targetHeight = Math.max(1, Math.round(height * scale));
+
+  const encoded = [];
+  const delays = [];
+  let totalBytes = 0;
+
+  for (const frame of decoded.frames) {
+    const image = await Jimp.fromBitmap({ data: frame.data, width, height });
+    if (scale < 1) image.resize({ w: targetWidth, h: targetHeight });
+    const png = await image.getBuffer('image/png');
+    const base64 = (Buffer.isBuffer(png) ? png : Buffer.from(png)).toString('base64');
+
+    totalBytes += base64.length;
+    if (totalBytes > ANIM_MAX_TOTAL_BYTES) return null;
+
+    encoded.push(base64);
+    delays.push(Math.max(ANIM_MIN_INTERVAL_MS, (frame.delay || 10) * 10));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  return { frames: encoded, delays };
+}
+
+function rememberAnimation(key, data) {
+  animFrames.set(key, data);
+  const at = animOrder.indexOf(key);
+  if (at !== -1) animOrder.splice(at, 1);
+  animOrder.push(key);
+
+  while (animOrder.length > ANIM_CACHE_LIMIT) {
+    const victim = animOrder.find((candidate) => !animActive.has(candidate));
+    if (victim === undefined) break;
+    animOrder.splice(animOrder.indexOf(victim), 1);
+    animFrames.delete(victim);
+  }
+}
+
+function ensureAnimationFrames(key) {
+  if (animFrames.has(key) || animPending.has(key) || animFailed.has(key)) return;
+
+  const entry = ready.get(key);
+  if (!entry?.url) return;
+
+  animPending.add(key);
+  getImageBuffer(entry.url, tokenProvider ? tokenProvider() : undefined)
+    .then((buffer) => (buffer && isGifBuffer(buffer) ? buildAnimationFrames(buffer) : null))
+    .then((data) => {
+      if (!data) {
+        animFailed.add(key);
+        const current = ready.get(key);
+        if (current) current.animated = false;
+        return;
+      }
+      rememberAnimation(key, data);
+    })
+    .catch((error) => {
+      animFailed.add(key);
+      logError(`Kitty gif decode failed: ${key}`, error);
+    })
+    .finally(() => {
+      animPending.delete(key);
+      syncAnimations();
+    });
+}
+
+function scheduleAnimationFrame(key) {
+  const state = animActive.get(key);
+  const data = animFrames.get(key);
+  const entry = ready.get(key);
+  if (!state || !data || !entry) {
+    stopAnimation(key);
+    return;
+  }
+
+  const delay = data.delays[state.index] ?? ANIM_MIN_INTERVAL_MS;
+  state.timer = setTimeout(() => {
+    const current = animActive.get(key);
+    if (!current) return;
+
+    current.index = (current.index + 1) % data.frames.length;
+    const sequences = buildFrameSequences(entry.id, data.frames[current.index]);
+    for (const sequence of sequences) {
+      if (!write(sequence)) {
+        stopAnimation(key);
+        return;
+      }
+    }
+    scheduleAnimationFrame(key);
+  }, delay);
+  state.timer.unref?.();
+}
+
+function startAnimation(key) {
+  if (animActive.has(key)) return;
+  if (!animFrames.has(key)) {
+    ensureAnimationFrames(key);
+    return;
+  }
+  animActive.set(key, { index: 0, timer: null });
+  scheduleAnimationFrame(key);
+}
+
+function stopAnimation(key) {
+  const state = animActive.get(key);
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+  animActive.delete(key);
+}
+
+function visibleImageIds() {
+  const lines = screenRef?.lines;
+  if (!Array.isArray(lines)) return null;
+
+  const ids = new Set();
+  for (const row of lines) {
+    if (!Array.isArray(row)) continue;
+    for (const cell of row) {
+      if (!cell) continue;
+      const ch = cell[1];
+      if (!ch || ch.codePointAt(0) !== PLACEHOLDER_CODEPOINT) continue;
+      ids.add((cell[0] >> 9) & 0x1ff);
+    }
+  }
+  return ids;
+}
+
+function animationsAllowed() {
+  const override = process.env.TERMOSLACK_KITTY_ANIM;
+  return !(override === '0' || override === 'false');
+}
+
+function syncAnimations() {
+  if (!enabled || !animationsAllowed()) {
+    for (const key of [...animActive.keys()]) stopAnimation(key);
+    return;
+  }
+
+  const ids = visibleImageIds();
+  if (!ids) return;
+
+  const wanted = new Set();
+  for (let i = usageOrder.emoji.length - 1; i >= 0 && wanted.size < ANIM_MAX_ACTIVE; i--) {
+    const key = usageOrder.emoji[i];
+    const entry = ready.get(key);
+    if (!entry?.animated || !ids.has(entry.id)) continue;
+    wanted.add(key);
+  }
+
+  for (const key of [...animActive.keys()]) {
+    if (!wanted.has(key)) stopAnimation(key);
+  }
+  for (const key of wanted) startAnimation(key);
+}
+
+function requestAnimationSync() {
+  if (animSyncTimer) return;
+  animSyncTimer = setTimeout(() => {
+    animSyncTimer = null;
+    try {
+      syncAnimations();
+    } catch (error) {
+      logError('Kitty animation sync failed', error);
+    }
+  }, ANIM_SYNC_DEBOUNCE_MS);
+  animSyncTimer.unref?.();
+}
+
+function forgetAnimation(key) {
+  stopAnimation(key);
+  animFrames.delete(key);
+  animFailed.delete(key);
+  const at = animOrder.indexOf(key);
+  if (at !== -1) animOrder.splice(at, 1);
+}
+
+export function stopKittyAnimations() {
+  for (const key of [...animActive.keys()]) stopAnimation(key);
+  if (animSyncTimer) {
+    clearTimeout(animSyncTimer);
+    animSyncTimer = null;
+  }
 }
 
 function drainFetchQueue() {
@@ -385,6 +664,12 @@ function drainFetchQueue() {
 }
 
 export function resetKittyGraphicsForTest() {
+  stopKittyAnimations();
+  animFrames.clear();
+  animOrder.length = 0;
+  animPending.clear();
+  animFailed.clear();
+  screenRef = null;
   enabled = false;
   program = null;
   tokenProvider = null;
