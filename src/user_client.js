@@ -70,7 +70,7 @@ const INFO_FETCH_CONCURRENCY = 8;
 const USER_MENTION_PATTERN = /<@[A-Z0-9]+(\|[^>]+)?>/g;
 const CHANNEL_MENTION_PATTERN = /<#[C][A-Z0-9]+(\|[^>]+)?>/g;
 const DATE_MENTION_PATTERN = /<!date\^[^>|]*(?:\|([^>]*))?>/g;
-const SUBTEAM_MENTION_PATTERN = /<!subteam\^[A-Z0-9]+(?:\|([^>]*))?>/g;
+const SUBTEAM_MENTION_PATTERN = /<!subteam\^([A-Z0-9]+)(?:\|([^>]*))?>/g;
 const BROADCAST_MENTION_PATTERN = /<!(channel|here|everyone)(?:\|[^>]*)?>/g;
 
 function resolveUserName(user) {
@@ -203,12 +203,53 @@ async function prefetchChannelNames(channelIds) {
   });
 }
 
+const usergroupNames = new Map();
+let usergroupsFetched = false;
+
+async function prefetchUsergroups() {
+    if (usergroupsFetched) return;
+    usergroupsFetched = true;
+
+    try {
+        const result = await userClient.usergroups.list({});
+        if (result.usergroups) {
+            for (const group of result.usergroups) usergroupNames.set(group.id, group.handle || group.name);
+            return;
+        }
+    } catch (error) {
+        logInfo('usergroups.list via OAuth unavailable, trying session credentials');
+    }
+
+    try {
+        const { config } = await import('./config.js');
+        if (!config.xoxc || !config.xoxd) return;
+        const fetch = (await import('node-fetch')).default;
+        const result = await fetch('https://slack.com/api/usergroups.list', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${config.xoxc}`,
+                Cookie: `d=${config.xoxd}`
+            }
+        }).then(r => r.json());
+        if (result.ok && result.usergroups) {
+            for (const group of result.usergroups) usergroupNames.set(group.id, group.handle || group.name);
+            logInfo(`Loaded ${usergroupNames.size} usergroups via session credentials`);
+        }
+    } catch (error) {
+        logError('Failed to fetch usergroups', error);
+    }
+}
+
 function replaceSpecialMentions(text) {
   if (!text.includes('<!')) return text;
 
   return text
     .replace(DATE_MENTION_PATTERN, (match, fallback) => (fallback ? fallback : match))
-    .replace(SUBTEAM_MENTION_PATTERN, (match, label) => (label ? `@${label.replace(/^@/, '')}` : '@group'))
+    .replace(SUBTEAM_MENTION_PATTERN, (match, id, label) => {
+      if (label) return `@${label.replace(/^@/, '')}`;
+      const name = usergroupNames.get(id);
+      return name ? `@${name}` : '@group';
+    })
     .replace(BROADCAST_MENTION_PATTERN, (match, keyword) => `@${keyword}`);
 }
 
@@ -365,7 +406,8 @@ async function decorateMessages(messages) {
   await Promise.all([
     prefetchUserNames(collectMentionedUserIds(messages)),
     prefetchChannelNames(collectMentionedChannelIds(messages)),
-    prefetchBotNames(collectUnresolvedBotIds(messages))
+    prefetchBotNames(collectUnresolvedBotIds(messages)),
+    prefetchUsergroups()
   ]);
 
   return messages.map(decorateMessage);
@@ -518,7 +560,8 @@ export async function searchMessages(query, options = {}) {
 
     await Promise.all([
       prefetchUserNames(userIds),
-      prefetchChannelNames(channelIds)
+      prefetchChannelNames(channelIds),
+      prefetchUsergroups()
     ]);
 
     const processedMatches = matches.map((match) => {

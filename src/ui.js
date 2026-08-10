@@ -137,6 +137,7 @@ export function createUI() {
 
   // Load custom emojis in background
   loadCustomEmojis();
+  loadSlackEmojiMap();
 
   // Header
   header = blessed.box({
@@ -2861,6 +2862,38 @@ async function loadCustomEmojis() {
 
 const CUSTOM_EMOJI_PATTERN = /:([\w가-힣ㄱ-ㅎㅏ-ㅣ+'-]+):/g;
 
+let slackEmojiMap = null;
+
+function loadSlackEmojiMap() {
+  if (slackEmojiMap) return;
+  slackEmojiMap = new Map();
+  import('emoji-datasource', { with: { type: 'json' } })
+    .catch(() => import('module').then(m => {
+      const require = m.createRequire(import.meta.url);
+      return { default: require('emoji-datasource') };
+    }))
+    .then(({ default: data }) => {
+      for (const entry of data) {
+        if (!entry.unified) continue;
+        const glyph = entry.unified.split('-').map(cp => String.fromCodePoint(parseInt(cp, 16))).join('');
+        for (const shortName of entry.short_names || []) {
+          if (!slackEmojiMap.has(shortName)) slackEmojiMap.set(shortName, glyph);
+        }
+      }
+      logInfo(`Slack emoji map loaded: ${slackEmojiMap.size} names`);
+    })
+    .catch(e => logError('Failed to load emoji-datasource', e));
+}
+
+function standardEmojiGlyph(name) {
+  const base = name.replace(/::skin-tone-\d+$/, '').replace(/:skin-tone-\d+$/, '');
+  let glyph;
+  try { glyph = emojify(`:${base}:`); } catch (e) { glyph = `:${base}:`; }
+  if (glyph !== `:${base}:`) return glyph;
+  if (slackEmojiMap?.size) return slackEmojiMap.get(base) || null;
+  return null;
+}
+
 const emojiSwatches = new Map();
 let swatchFetchQueue = [];
 let swatchFetchActive = 0;
@@ -2962,7 +2995,7 @@ function processText(text) {
   const theme = getTheme();
   text = text.replace(CUSTOM_EMOJI_PATTERN, (match, name) => {
     const resolved = resolveCustomEmoji(name);
-    if (!resolved) return match;
+    if (!resolved) return standardEmojiGlyph(name) || match;
     if (resolved.glyph) return resolved.glyph;
 
     if (isKittyGraphicsEnabled()) {
@@ -2990,9 +3023,9 @@ function formatReactions(msg, fmt, theme) {
   }
 
   const parts = msg.reactions.map(r => {
-    let glyph;
-    try { glyph = emojify(`:${r.name}:`); } catch (e) { glyph = `:${r.name}:`; }
-    if (glyph === `:${r.name}:`) {
+    let glyph = standardEmojiGlyph(r.name);
+    if (!glyph) {
+      glyph = `:${r.name}:`;
       const resolved = resolveCustomEmoji(r.name);
       if (resolved?.glyph) {
         glyph = resolved.glyph;
