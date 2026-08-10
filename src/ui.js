@@ -2089,6 +2089,18 @@ function processText(text) {
   return text;
 }
 
+function formatReactions(msg, borderColor) {
+  if (!msg.reactions || msg.reactions.length === 0) return '';
+  const theme = getTheme();
+  const parts = msg.reactions.map(r => {
+    let glyph;
+    try { glyph = emojify(`:${r.name}:`); } catch (e) { glyph = `:${r.name}:`; }
+    if (glyph === `:${r.name}:`) glyph = customEmojis[r.name] ? `:${r.name}:` : glyph;
+    return `${glyph} ${r.count}`;
+  });
+  return `\n{${borderColor}-fg}│{/${borderColor}-fg}   ${theme.tags.time}${parts.join('   ')}${theme.tags.reset}`;
+}
+
 function displayMessages(msgs) {
   if (!msgs || msgs.length === 0) {
     chatBox.setContent('No messages in this channel.');
@@ -2161,7 +2173,9 @@ function displayMessages(msgs) {
       threadLine = `\n{${borderColor}-fg}│{/${borderColor}-fg}\n{${borderColor}-fg}│{/${borderColor}-fg}   ${theme.tags.thread}💬 ${msg.reply_count} ${msg.reply_count === 1 ? 'reply' : 'replies'}${theme.tags.reset}`;
     }
     
-    return `${boxTop}\n${headerLine}\n{${borderColor}-fg}│{/${borderColor}-fg}\n${textLines}${threadLine}\n${boxBottom}`;
+    const reactionsLine = formatReactions(msg, borderColor);
+
+    return `${boxTop}\n${headerLine}\n{${borderColor}-fg}│{/${borderColor}-fg}\n${textLines}${reactionsLine}${threadLine}\n${boxBottom}`;
   });
 
   chatBox.setContent(messageBlocks.join('\n'));
