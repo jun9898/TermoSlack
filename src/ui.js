@@ -780,14 +780,15 @@ export function createUI() {
     }
   });
 
-  // Ctrl+F - Activate search
-  screen.key(['C-f'], () => {
-    if(!searchMode) {
+  // Ctrl+F or F - Activate search
+  screen.key(['C-f', 'f'], () => {
+    if (isTyping()) return;
+    if (!searchMode) {
       searchMode = true;
       searchBox.show();
       searchBox.focus();
       screen.render();
-  }
+    }
   });
 
   // Ctrl+S - Global Search
